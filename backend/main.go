@@ -70,6 +70,8 @@ func main() {
 	mux.HandleFunc("GET /api/posts/{id}", s.handleGetPost)
 	mux.HandleFunc("PUT /api/posts/{id}", s.handleUpdatePost)
 	mux.HandleFunc("GET /api/posts/{id}/history", s.handleHistory)
+	mux.HandleFunc("POST /api/posts/{id}/revert", s.handleRevert)
+	mux.HandleFunc("GET /api/objects/{sha}", s.handleObject)
 	mux.HandleFunc("GET /api/posts/{id}/diff", s.handleDiff)
 	mux.HandleFunc("GET /api/posts/{id}/blob", s.handleBlob)
 	mux.HandleFunc("POST /api/posts/{id}/star", s.handleStar)

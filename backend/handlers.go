@@ -225,6 +225,8 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"reviewers":     p.Reviewers,
 		"canPush":       canPushUser(p, viewer),
 		"invited":       viewer != nil && containsHandle(p.CoAuthorInvites, viewer.Handle),
+		"verified":      p.Verified,
+		"genesis":       p.Genesis,
 	}
 }
 
@@ -280,7 +282,31 @@ func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errNotFound)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"post": postPayload(p, s.currentUser(r))})
+	proof := s.store.VerifyHistory(p.ID)
+	p.Verified = proof.Verified
+	p.Genesis = proof.Genesis
+	payload := postPayload(p, s.currentUser(r))
+	at := strings.TrimSpace(r.URL.Query().Get("at"))
+	if at != "" {
+		exact, err := s.store.ResolveSHA(p.ID, at)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		raw, err := s.store.Blob(p.ID, exact)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		sub, body, story := parsePostFile(raw)
+		payload["at"] = exact
+		payload["historical"] = exact != p.HeadSHA
+		payload["subject"] = sub
+		payload["body"] = body
+		payload["story"] = story
+		payload["shortSha"] = shortSHA(exact)
+	}
+	writeJSON(w, 200, map[string]any{"post": payload, "history": proof})
 }
 
 func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +391,8 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"commits": hist})
+	proof := s.store.VerifyHistory(p.ID)
+	writeJSON(w, 200, map[string]any{"commits": hist, "history": proof})
 }
 
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
@@ -956,6 +983,58 @@ func (s *Server) handleResolvePR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"pr": pr})
+}
+
+func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		SHA     string `json:"sha"`
+		Reason  string `json:"reason"`
+		Signoff *bool  `json:"signoff"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	signoff := true
+	if in.Signoff != nil {
+		signoff = *in.Signoff
+	}
+	p, err := s.store.Revert(r.PathValue("id"), in.SHA, in.Reason, u, signoff)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
+	sha := r.PathValue("sha")
+	p, exact := s.store.FindByObject(sha)
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	raw, err := s.store.Blob(p.ID, exact)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	sub, body, story := parsePostFile(raw)
+	proof := s.store.VerifyHistory(p.ID)
+	p.Verified = proof.Verified
+	p.Genesis = proof.Genesis
+	payload := postPayload(p, s.currentUser(r))
+	payload["at"] = exact
+	payload["historical"] = exact != p.HeadSHA
+	payload["subject"] = sub
+	payload["body"] = body
+	payload["story"] = story
+	payload["shortSha"] = shortSHA(exact)
+	writeJSON(w, 200, map[string]any{"post": payload, "sha": exact, "history": proof})
 }
 
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {

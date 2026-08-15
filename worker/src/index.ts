@@ -582,7 +582,34 @@ export class GitPostStore extends DurableObject<Env> {
       reviewers: parseReviews(p.reviewers_json),
       canPush: canPushPost(p, viewer),
       invited: !!(viewer && parseTopics(p.invites_json).includes(viewer.handle)),
+      verified: this.verifyHistory(p.id).verified,
+      genesis: this.verifyHistory(p.id).genesis,
     };
+  }
+
+  private verifyHistory(id: string) {
+    const rows = this.sql<any>("SELECT sha, parent_sha FROM commits WHERE post_id = ? ORDER BY created_at ASC", id);
+    if (!rows.length) return { verified: false, genesis: "", head: "", commitCount: 0, reason: "empty object store" };
+    const bySha = new Map(rows.map((r) => [r.sha, r]));
+    let prev = "";
+    for (const r of rows) {
+      if (prev && r.parent_sha && r.parent_sha !== prev) {
+        return { verified: false, genesis: rows[0].sha, head: rows[rows.length - 1].sha, commitCount: rows.length, reason: "broken parent link at " + shortSha(r.sha) };
+      }
+      if (prev && !r.parent_sha) {
+        return { verified: false, genesis: rows[0].sha, head: rows[rows.length - 1].sha, commitCount: rows.length, reason: "missing parent at " + shortSha(r.sha) };
+      }
+      if (r.parent_sha && !bySha.has(r.parent_sha) && r.parent_sha !== prev) {
+        // first commit may reference a forked parent from another post
+      }
+      prev = r.sha;
+    }
+    const p = this.findPost(id);
+    const head = p?.head_sha || rows[rows.length - 1].sha;
+    if (head && head !== rows[rows.length - 1].sha) {
+      return { verified: false, genesis: rows[0].sha, head, commitCount: rows.length, reason: "HEAD is not the tip of first-parent history" };
+    }
+    return { verified: true, genesis: rows[0].sha, head, commitCount: rows.length };
   }
 
   private recordEvent(kind: string, postId: string, sha: string, actor: string) {
@@ -1238,6 +1265,26 @@ export class GitPostStore extends DurableObject<Env> {
         });
       }
 
+      if (path.startsWith("/api/objects/")) {
+        const sha = decodeURIComponent(path.slice("/api/objects/".length));
+        const c =
+          this.one<any>("SELECT * FROM commits WHERE sha = ?", sha) ||
+          this.sql<any>("SELECT * FROM commits WHERE sha LIKE ?", sha + "%")[0];
+        if (!c) return err(404, "not found");
+        const p = this.findPost(c.post_id);
+        if (!p) return err(404, "not found");
+        const proof = this.verifyHistory(p.id);
+        const payload: any = this.postPayload(p, viewer);
+        payload.at = c.sha;
+        payload.historical = c.sha !== p.head_sha;
+        payload.subject = c.subject;
+        payload.body = c.body;
+        payload.shortSha = shortSha(c.sha);
+        payload.verified = proof.verified;
+        payload.genesis = proof.genesis;
+        return json({ post: payload, sha: c.sha, history: proof });
+      }
+
       if (path === "/api/graph" && method === "GET") {
         return json(this.buildGraph());
       }
@@ -1292,7 +1339,28 @@ export class GitPostStore extends DurableObject<Env> {
         const p = this.findPost(ref);
         if (!p && method !== "POST") return err(404, "not found");
 
-        if (!rest && method === "GET") return json({ post: this.postPayload(p, viewer) });
+        if (!rest && method === "GET") {
+          const proof = this.verifyHistory(p.id);
+          const payload: any = this.postPayload(p, viewer);
+          payload.verified = proof.verified;
+          payload.genesis = proof.genesis;
+          const at = url.searchParams.get("at") || "";
+          if (at) {
+            const c =
+              this.one<any>("SELECT * FROM commits WHERE sha = ? AND post_id = ?", at, p.id) ||
+              this.sql<any>("SELECT * FROM commits WHERE post_id = ? AND sha LIKE ?", p.id, at + "%")[0];
+            if (!c) return err(404, "not found");
+            payload.at = c.sha;
+            payload.historical = c.sha !== p.head_sha;
+            payload.subject = c.subject;
+            payload.body = c.body;
+            payload.shortSha = shortSha(c.sha);
+            if (c.story_json) {
+              try { payload.story = JSON.parse(c.story_json); } catch { /* ignore */ }
+            }
+          }
+          return json({ post: payload, history: proof });
+        }
 
         if (!rest && method === "PUT") {
           if (!viewer) return err(401, "unauthorized");
@@ -1314,7 +1382,26 @@ export class GitPostStore extends DurableObject<Env> {
             date: c.created_at,
             parents: c.parent_sha ? [c.parent_sha] : [],
           }));
-          return json({ commits });
+          return json({ commits, history: this.verifyHistory(p.id) });
+        }
+
+        if (rest === "revert" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          if (!canPushPost(p, viewer)) return err(403, p.protected ? "main is protected — open a pull request" : "forbidden");
+          const inb = await req.json<any>();
+          const reason = String(inb.reason || "").trim();
+          if (!reason || reason.length > 2000) return err(400, "bad request");
+          const c =
+            this.one<any>("SELECT * FROM commits WHERE sha = ? AND post_id = ?", inb.sha, p.id) ||
+            this.sql<any>("SELECT * FROM commits WHERE post_id = ? AND sha LIKE ?", p.id, String(inb.sha || "") + "%")[0];
+          if (!c) return err(404, "not found");
+          const parent = c.parent_sha ? this.one<any>("SELECT * FROM commits WHERE sha = ?", c.parent_sha) : null;
+          if (!parent) return err(400, "cannot revert the first commit");
+          const subject = `Revert "${c.subject}"`;
+          const body = parent.body || "";
+          const sha = await this.commit(p.id, viewer, subject, body, parent.story_json ? JSON.parse(parent.story_json) : null, new Date().toISOString(), p.head_sha);
+          this.recordEvent("revert", p.id, sha, viewer.handle);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
         }
 
         if (rest === "diff" && method === "GET") {

@@ -6,6 +6,8 @@
       <span class="sha">{{ post.shortSha }}</span>
       ·
       {{ post.defaultBranch }}
+      ·
+      <VerifiedBadge :verified="!!post.verified" :reason="historyProof?.reason" />
       <span v-if="post.parentPostId">
         ·
         <span class="pill">{{ intentLabel(post.forkIntent) || "fork" }}</span>
@@ -13,6 +15,12 @@
         <NuxtLink :to="`/p/${post.parentPostId}`">{{ post.parentPostId.slice(0, 8) }}</NuxtLink>
       </span>
     </p>
+    <div v-if="post.historical" class="hist-banner">
+      Viewing sealed object <span class="sha">{{ post.at?.slice(0, 12) }}</span>.
+      Edits always create a new commit —
+      <NuxtLink :to="`/p/${post.id}`">return to the live tip</NuxtLink>.
+    </div>
+
     <header class="post-head">
       <h1 class="subject">{{ post.subject }}</h1>
       <p v-if="post.forkIntentNote" class="muted" style="margin-top: -8px">{{ post.forkIntentNote }}</p>
@@ -76,22 +84,29 @@
     </section>
 
     <section v-else-if="tab === 'history'">
-      <p class="muted" style="margin-top: 0">Full edit history. This is a real <span class="mono">git log</span>.</p>
+      <p class="muted" style="margin-top: 0">
+        Every revision is addressable forever. Edits are new commits — never silent rewrites.
+      </p>
       <div v-for="c in commits" :key="c.sha" class="commit-row">
         <span class="dot" />
         <div>
-          <div>{{ c.subject }}</div>
+          <div>
+            <NuxtLink :to="`/p/${post.id}/o/${c.sha}`">{{ c.subject }}</NuxtLink>
+          </div>
           <div class="log-meta">
             <span>{{ c.author }}</span>
             <time>{{ formatAgo(c.date) }}</time>
             <button class="btn btn-ghost btn-sm" type="button" @click="selectCommit(c.sha)">view blob</button>
+            <NuxtLink :to="`/p/${post.id}/o/${c.sha}`" class="btn btn-ghost btn-sm">permalink</NuxtLink>
+            <button v-if="post.canPush && c.sha !== post.headSha" class="btn btn-ghost btn-sm" type="button" @click="revertSha = c.sha">revert</button>
             <button v-if="post.canPush" class="btn btn-ghost btn-sm" type="button" @click="cherrySha = c.sha">mark cherry-pick</button>
           </div>
+          <p v-if="isRevert(c)" class="subtle" style="margin: 6px 0 0">{{ revertNote(c) }}</p>
           <div v-if="c.trailers?.length" class="trailers">
             <code v-for="t in c.trailers" :key="t">{{ t }}</code>
           </div>
         </div>
-        <span class="sha">{{ c.shortSha }}</span>
+        <NuxtLink :to="`/p/${post.id}/o/${c.sha}`" class="sha">{{ c.shortSha }}</NuxtLink>
       </div>
       <article v-if="blob" style="margin-top: 24px">
         <p class="kicker">blob @ {{ selectedSha?.slice(0, 7) }}</p>
@@ -206,6 +221,7 @@
       @close="excerpt = ''"
       @picked="onPicked"
     />
+    <RevertSheet v-if="revertSha" :post-id="post.id" :sha="revertSha" @close="revertSha = ''" @reverted="onReverted" />
     <ParagraphPropose
       v-if="proposal"
       :post-id="post.id"
@@ -259,6 +275,8 @@ const proposeMode = ref(false);
 const proposal = ref<{ index: number; text: string } | null>(null);
 const remotes = ref<string[]>([]);
 const excerpt = ref("");
+const revertSha = ref("");
+const historyProof = ref<any>(null);
 
 const followingAll = computed(() => {
   const topics: string[] = post.value?.topics || [];
@@ -284,8 +302,10 @@ const canPropose = computed(() => user.value && post.value && !mine.value);
 async function load() {
   loading.value = true;
   try {
-    const data = await api<{ post: any }>(`/api/posts/${route.params.id}`);
+    const atq = route.query.at ? `?at=${encodeURIComponent(String(route.query.at))}` : "";
+    const data = await api<{ post: any; history?: any }>(`/api/posts/${route.params.id}${atq}`);
     post.value = data.post;
+    historyProof.value = data.history || null;
     try {
       const [h, b, p, f] = await Promise.all([
         api<{ commits: any[] }>(`/api/posts/${data.post.id}/history`),
@@ -373,6 +393,20 @@ function onSelect() {
 function onPicked(id: string) {
   excerpt.value = "";
   navigateTo(`/p/${id}`);
+}
+
+function isRevert(c: any) {
+  return /^Revert /.test(c.subject || "") || /This reverts commit/i.test(c.body || "");
+}
+
+function revertNote(c: any) {
+  const line = (c.body || "").split("\n").find((l: string) => l.trim() && !l.startsWith("This reverts") && !l.startsWith("Signed-off") && !l.startsWith("Co-authored"));
+  return line || "Narrative revert — the original commit remains addressable.";
+}
+
+function onReverted() {
+  revertSha.value = "";
+  load();
 }
 
 async function togglePropose() {
@@ -470,6 +504,7 @@ onMounted(async () => {
       remotes.value = [];
     }
   }
+  if (route.hash === "#history") tab.value = "history";
   await load();
 });
 
@@ -490,6 +525,10 @@ async function followTopics() {
 }
 
 watch(() => route.params.id, () => load());
+watch(() => route.query.at, () => load());
+watch(() => route.hash, (h) => {
+  if (h === "#history") tab.value = "history";
+});
 watch(tab, async (id) => {
   if (id === "diverge" && !diverge.value) await loadDiverge();
 });

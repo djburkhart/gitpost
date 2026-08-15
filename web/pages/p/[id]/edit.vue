@@ -1,7 +1,8 @@
 <template>
   <main class="page article" v-if="post">
-    <p class="kicker">amend · {{ post.shortSha }}</p>
+    <p class="kicker">new commit · {{ post.shortSha }}</p>
     <h1 class="subject" style="font-size: var(--text-2xl); margin-top: 0">New commit on this object</h1>
+    <p class="muted">This writes a new revision. The previous SHA stays addressable forever — nothing is rewritten.</p>
     <form @submit.prevent="submit">
       <div class="field">
         <label for="subject">

@@ -1732,3 +1732,34 @@ html.wysimark-on {
   font: inherit;
   resize: vertical;
 }
+
+.verified {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+
+.verified.ok {
+  color: var(--add);
+}
+
+.verified.broken {
+  color: var(--del);
+}
+
+.verified-mark {
+  font-size: 0.65rem;
+}
+
+.hist-banner {
+  margin: 0 0 var(--space-5);
+  padding: 12px 14px;
+  background: var(--bg-subtle);
+  border-left: 2px solid var(--sha);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}

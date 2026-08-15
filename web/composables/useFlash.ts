@@ -17,6 +17,12 @@ export function friendlyError(raw: string): { title: string; detail?: string } {
       detail: "That commit is already applied here — nothing new to cherry-pick.",
     };
   }
+  if (lower.includes("cannot revert") || lower.includes("empty revert")) {
+    return {
+      title: "Nothing to revert",
+      detail: "That change is already undone, or it’s the first commit.",
+    };
+  }
   if (lower.includes("protected")) {
     return {
       title: "Main is protected",

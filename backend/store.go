@@ -132,6 +132,8 @@ type Post struct {
 	Maintainers     []string         `json:"maintainers,omitempty"`
 	Protected       bool             `json:"protected"`
 	Reviewers       []ReviewRequest  `json:"reviewers,omitempty"`
+	Verified        bool             `json:"verified"`
+	Genesis         string           `json:"genesis,omitempty"`
 }
 
 type Story struct {
@@ -506,6 +508,8 @@ func (s *Store) initRepo(id, name, email string) (string, error) {
 	}
 	_, _ = s.git(dir, "config", "user.name", name)
 	_, _ = s.git(dir, "config", "user.email", email)
+	_, _ = s.git(dir, "config", "core.logAllRefUpdates", "true")
+	_, _ = s.git(dir, "config", "receive.denyNonFastForwards", "true")
 	return dir, nil
 }
 
@@ -814,7 +818,26 @@ func (s *Store) FindPost(ref string) *Post {
 			break
 		}
 	}
+	if found == nil && len(ref) >= 7 && isHexRef(ref) {
+		for _, p := range s.posts {
+			if exact, err := s.ResolveSHA(p.ID, ref); err == nil && exact != "" {
+				cp := *p
+				s.refreshPost(&cp)
+				found = &cp
+				break
+			}
+		}
+	}
 	return found
+}
+
+func isHexRef(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) GetPostLocked(id string) *Post {
@@ -853,7 +876,7 @@ func (s *Store) History(id string) ([]CommitInfo, error) {
 	if s.posts[id] == nil {
 		return nil, errNotFound
 	}
-	out, err := s.git(s.repoDir(id), "log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e")
+	out, err := s.git(s.repoDir(id), "log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P%x1f%b%x1e")
 	if err != nil {
 		return nil, err
 	}
@@ -868,9 +891,13 @@ func (s *Store) History(id string) ([]CommitInfo, error) {
 			continue
 		}
 		dt, _ := time.Parse(time.RFC3339, parts[3])
+		parents := []string{}
 		body := ""
 		if len(parts) > 5 {
-			body = strings.TrimSpace(parts[5])
+			parents = strings.Fields(parts[5])
+		}
+		if len(parts) > 6 {
+			body = strings.TrimSpace(parts[6])
 		}
 		clean, trailers := parseTrailers(body)
 		commits = append(commits, CommitInfo{
@@ -881,6 +908,7 @@ func (s *Store) History(id string) ([]CommitInfo, error) {
 			Date:     dt,
 			Subject:  parts[4],
 			Body:     clean,
+			Parents:  parents,
 			Trailers: trailers,
 		})
 	}
