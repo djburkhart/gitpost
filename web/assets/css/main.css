@@ -991,8 +991,8 @@ table.data th {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: hidden;
-  background: #f6f5f0;
-  color: #161615;
+  background: var(--bg-elevated);
+  color: var(--fg);
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 
@@ -1001,5 +1001,122 @@ table.data th {
 }
 
 .wysimark-shell :focus-visible {
-  outline-color: #3d3d38;
+  outline-color: var(--accent);
+}
+
+html.wysimark-on {
+  --shade-50: #161816;
+  --shade-100: #1c1f1c;
+  --shade-200: #262926;
+  --shade-300: #3d413c;
+  --shade-400: #6d6f68;
+  --shade-500: #9a9b93;
+  --shade-600: #c5c2b6;
+  --shade-700: #eceae4;
+  --shade-800: #eceae4;
+  --shade-900: #f4f3ee;
+  --blue-50: color-mix(in oklab, var(--sha) 16%, var(--bg));
+  --blue-100: color-mix(in oklab, var(--sha) 24%, var(--bg));
+  --blue-200: color-mix(in oklab, var(--sha) 32%, var(--bg));
+  --blue-300: color-mix(in oklab, var(--sha) 48%, var(--bg));
+  --blue-400: var(--sha);
+  --blue-500: var(--accent);
+  --blue-600: var(--accent);
+  --blue-700: var(--fg);
+  --blue-800: var(--fg);
+  --blue-900: var(--fg);
+  --select-color: color-mix(in oklab, var(--sha) 40%, transparent);
+  --select-editor-color: color-mix(in oklab, var(--sha) 22%, transparent);
+  --hover-color: color-mix(in oklab, var(--sha) 22%, var(--bg));
+  --link-color: var(--sha);
+  --link-hover-color: var(--accent);
+  --code-block-bgcolor: #101210;
+  --code-block-border-color: var(--border-strong);
+  --inline-code-bgcolor: var(--bg-subtle);
+  --inline-code-border-color: var(--border);
+  --table-border-color: var(--border-strong);
+  --table-row-border-color: var(--border);
+  --table-column-border-color: var(--border);
+  --table-head-bgcolor: var(--bg-subtle);
+  --table-menu-bgcolor: var(--bg-subtle);
+  --table-menu-hover-bgcolor: var(--bg-hover);
+  --hr-color: var(--border-strong);
+}
+
+.wysimark-shell,
+.wysimark-shell * {
+  font-family: var(--font-body);
+}
+
+.wysimark-shell [data-slate-editor] {
+  color: var(--fg);
+  caret-color: var(--accent);
+  line-height: var(--leading-normal);
+}
+
+.wysimark-shell [data-slate-editor] pre,
+.wysimark-shell [data-slate-editor] code {
+  font-family: var(--font-mono);
+}
+
+.wysimark-shell [data-item-type="button"] {
+  color: var(--fg-muted);
+  border-radius: var(--radius-xs);
+}
+
+.wysimark-shell [data-item-type="button"]:hover,
+.wysimark-shell [data-item-type="button"].--active {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+
+.wysimark-shell [data-item-type="divider"] > * {
+  background: var(--border-strong) !important;
+}
+
+.wysimark-shell .--empty {
+  color: var(--fg-subtle) !important;
+}
+
+.wysimark-layer {
+  background: var(--bg-elevated) !important;
+  color: var(--fg) !important;
+  border-color: var(--border-strong) !important;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  font-family: var(--font-body);
+}
+
+.wysimark-paper {
+  background: var(--bg-elevated) !important;
+  color: var(--fg) !important;
+}
+
+.wysimark-paper:hover,
+.wysimark-layer [class]:hover {
+  background: var(--bg-hover) !important;
+}
+
+.wysimark-layer .--title {
+  color: var(--fg) !important;
+}
+
+.wysimark-layer .--hotkey {
+  color: var(--fg-subtle) !important;
+}
+
+.wysimark-tip {
+  background: #202420 !important;
+  color: var(--fg) !important;
+  border: 1px solid var(--border-strong);
+  font-family: var(--font-body) !important;
+}
+
+.wysimark-shell input,
+.wysimark-layer input,
+.wysimark-shell textarea,
+.wysimark-layer textarea {
+  background: var(--bg) !important;
+  color: var(--fg) !important;
+  border-color: var(--border-strong) !important;
+  font-family: var(--font-body) !important;
 }
