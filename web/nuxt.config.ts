@@ -13,13 +13,13 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
-      title: "gitpo.st — post like you commit",
+      title: "gitpo.st — the commit log for writing",
       htmlAttrs: { lang: "en" },
       meta: [
         { name: "viewport", content: "width=device-width, initial-scale=1" },
         {
           name: "description",
-          content: "A social log for writing. Every post is a real Git commit.",
+          content: "The commit log for writing. Every post is a real Git object — subject, body, SHA, history, forks, and pull requests.",
         },
         { name: "theme-color", content: "#0b0c0b" },
       ],
