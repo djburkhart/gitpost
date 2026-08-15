@@ -31,6 +31,7 @@
         </div>
         <StoryEmbed v-if="story" :story="story" />
       </details>
+      <TopicField v-model="topics" label="Remotes" placeholder="ai-safety, writing…" />
       <div class="row">
         <button class="btn btn-primary" type="submit" :disabled="busy">Commit</button>
         <NuxtLink to="/" class="btn btn-ghost">Cancel</NuxtLink>
@@ -46,6 +47,7 @@ const subject = ref("");
 const body = ref("");
 const storyUrl = ref("");
 const story = ref<any>(null);
+const topics = ref<string[]>([]);
 const busy = ref(false);
 const editor = ref<{ getMarkdown: () => string } | null>(null);
 
@@ -75,7 +77,7 @@ async function submit() {
     const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>("/api/posts", {
       method: "POST",
-      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: storyUrl.value }),
+      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: storyUrl.value, topics: topics.value }),
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {

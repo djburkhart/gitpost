@@ -126,6 +126,7 @@ type Post struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 	CommitCount   int       `json:"commitCount"`
 	ForkCount     int       `json:"forkCount"`
+	Topics        []string  `json:"topics,omitempty"`
 }
 
 type Story struct {
@@ -207,6 +208,8 @@ type persisted struct {
 	Audits   []AuditEvent  `json:"audits"`
 	Settings Settings      `json:"settings"`
 	PRSeq    int           `json:"prSeq"`
+	Events   []Activity    `json:"events"`
+	Remotes  []RemoteFollow `json:"remotes"`
 }
 
 type Store struct {
@@ -222,6 +225,8 @@ type Store struct {
 	audits   []AuditEvent
 	settings Settings
 	prSeq    int
+	events   []Activity
+	remotes  map[string][]string
 }
 
 func NewStore(root string) (*Store, error) {
@@ -237,6 +242,7 @@ func NewStore(root string) (*Store, error) {
 		prs:      map[string]*PullRequest{},
 		sessions: map[string]*Session{},
 		invites:  map[string]*Invite{},
+		remotes:  map[string][]string{},
 		settings: Settings{SignupMode: SignupInvite, MinPassword: 12},
 	}
 	_ = s.load()
@@ -292,6 +298,11 @@ func (s *Store) load() error {
 		cp := p.Invites[i]
 		s.invites[cp.Code] = &cp
 	}
+	s.events = p.Events
+	s.remotes = map[string][]string{}
+	for _, r := range p.Remotes {
+		s.remotes[r.Handle] = append(s.remotes[r.Handle], r.Topic)
+	}
 	return nil
 }
 
@@ -316,6 +327,12 @@ func (s *Store) save() error {
 	}
 	p.Audits = s.audits
 	p.Settings = s.settings
+	p.Events = s.events
+	for handle, topics := range s.remotes {
+		for _, t := range topics {
+			p.Remotes = append(p.Remotes, RemoteFollow{Handle: handle, Topic: t})
+		}
+	}
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -675,7 +692,7 @@ func (s *Store) UserByID(id string) *User {
 	return s.users[id]
 }
 
-func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *Story, when time.Time) (*Post, error) {
+func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *Story, topics []string, when time.Time) (*Post, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	subject = strings.TrimSpace(subject)
@@ -713,12 +730,14 @@ func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *S
 		CreatedAt:     when,
 		UpdatedAt:     when,
 		CommitCount:   1,
+		Topics:        extractTopics(topics, subject, body),
 	}
 	s.posts[id] = p
+	s.recordLocked("commit", id, sha, owner.Handle)
 	return p, s.save()
 }
 
-func (s *Store) AmendPost(id string, editor *User, subject, body string, story *Story) (*Post, error) {
+func (s *Store) AmendPost(id string, editor *User, subject, body string, story *Story, topics []string) (*Post, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.posts[id]
@@ -751,6 +770,12 @@ func (s *Store) AmendPost(id string, editor *User, subject, body string, story *
 	p.Slug = slugify(subject)
 	p.UpdatedAt = time.Now().UTC()
 	p.CommitCount = s.commitCount(id)
+	if topics != nil {
+		p.Topics = extractTopics(topics, subject, body)
+	} else {
+		p.Topics = extractTopics(p.Topics, subject, body)
+	}
+	s.recordLocked("commit", id, sha, editor.Handle)
 	return p, s.save()
 }
 
@@ -959,9 +984,12 @@ func (s *Store) Fork(id string, user *User, intent, note string) (*Post, error) 
 		CreatedAt:     now,
 		UpdatedAt:     now,
 		CommitCount:   s.commitCount(nid),
+		Topics:        append([]string{}, src.Topics...),
 	}
 	s.posts[nid] = p
 	s.refreshPost(src)
+	s.recordLocked("fork", src.ID, src.HeadSHA, user.Handle)
+	s.recordLocked("fork", nid, sha, user.Handle)
 	return p, s.save()
 }
 
@@ -1061,6 +1089,7 @@ func (s *Store) CherryPick(id, sha string, user *User) (*Post, error) {
 	}
 	s.refreshPost(p)
 	p.UpdatedAt = time.Now().UTC()
+	s.recordLocked("cherry", p.ID, p.HeadSHA, user.Handle)
 	return p, s.save()
 }
 
@@ -1097,6 +1126,7 @@ func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Pos
 	}
 	s.refreshPost(dst)
 	dst.UpdatedAt = time.Now().UTC()
+	s.recordLocked("cherry", dst.ID, dst.HeadSHA, user.Handle)
 	return dst, s.save()
 }
 
@@ -1184,6 +1214,7 @@ func (s *Store) OpenPR(author *User, title, body, sourceID, targetID, kind strin
 	s.prSeq++
 	pr.Number = s.prSeq
 	s.prs[pr.ID] = pr
+	s.recordLocked("pr", targetID, pr.TargetSHA, author.Handle)
 	return pr, s.save()
 }
 
@@ -1295,6 +1326,7 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 	pr.UpdatedAt = time.Now().UTC()
 	s.refreshPost(dst)
 	dst.UpdatedAt = pr.UpdatedAt
+	s.recordLocked("merge", dst.ID, pr.MergedSHA, user.Handle)
 	return pr, s.save()
 }
 

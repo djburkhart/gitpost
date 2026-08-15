@@ -22,6 +22,10 @@
         <span>{{ post.starCount }} {{ post.starCount === 1 ? "star" : "stars" }}</span>
         <span>{{ post.forkCount }} {{ post.forkCount === 1 ? "fork" : "forks" }}</span>
       </div>
+      <div v-if="post.topics?.length" class="topic-row">
+        <NuxtLink v-for="t in post.topics" :key="t" :to="`/explore?q=remote:${t}`" class="pill">remote:{{ t }}</NuxtLink>
+        <button v-if="user && !followingAll" class="btn btn-ghost btn-sm" type="button" @click="followTopics">Track remotes</button>
+      </div>
     </header>
 
     <div class="actions">
@@ -57,7 +61,8 @@
         <p v-if="!paragraphs.length" class="empty">No paragraphs to propose against yet.</p>
       </template>
       <template v-else>
-        <MarkdownBody :source="post.body" />
+        <p class="subtle blame-hint">Hover a paragraph to see who last changed it.</p>
+        <BlameBody :post-id="post.id" :fallback="post.body" />
         <StoryEmbed v-if="post.story" :story="post.story" />
       </template>
     </section>
@@ -222,6 +227,12 @@ const flash = useFlash();
 const showFork = ref(false);
 const proposeMode = ref(false);
 const proposal = ref<{ index: number; text: string } | null>(null);
+const remotes = ref<string[]>([]);
+
+const followingAll = computed(() => {
+  const topics: string[] = post.value?.topics || [];
+  return topics.length > 0 && topics.every((t) => remotes.value.includes(t));
+});
 
 const visibleTabs = computed(() =>
   tabs.filter((t) => (t.id === "diverge" ? !!post.value?.parentPostId : true)),
@@ -404,8 +415,32 @@ async function adminDelete() {
 
 onMounted(async () => {
   if (!ready.value) await refresh();
+  if (user.value) {
+    try {
+      const r = await api<{ remotes: string[] }>("/api/remotes");
+      remotes.value = r.remotes || [];
+    } catch {
+      remotes.value = [];
+    }
+  }
   await load();
 });
+
+async function followTopics() {
+  if (!user.value) return navigateTo(`/login?next=/p/${route.params.id}`);
+  for (const t of post.value.topics || []) {
+    try {
+      const data = await api<{ remotes: string[] }>("/api/remotes", {
+        method: "POST",
+        body: JSON.stringify({ topic: t }),
+      });
+      remotes.value = data.remotes || [];
+    } catch (e: any) {
+      flash.error(e);
+    }
+  }
+  flash.ok("Tracking remotes");
+}
 
 watch(() => route.params.id, () => load());
 watch(tab, async (id) => {

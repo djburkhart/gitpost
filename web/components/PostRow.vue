@@ -7,6 +7,7 @@
       <NuxtLink :to="`/p/${post.id}`" class="sha">{{ post.shortSha }}</NuxtLink>
       <span v-if="post.parentPostId" class="pill">{{ intentLabel(post.forkIntent) || "fork" }}</span>
       <span v-if="post.storyUrl" class="pill">story</span>
+      <span v-for="t in (post.topics || []).slice(0, 3)" :key="t" class="pill">remote:{{ t }}</span>
     </div>
     <h2 class="subject">
       <NuxtLink :to="`/p/${post.id}`">{{ post.subject }}</NuxtLink>

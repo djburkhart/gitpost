@@ -211,18 +211,44 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"updatedAt":     p.UpdatedAt,
 		"commitCount":   p.CommitCount,
 		"forkCount":     p.ForkCount,
+		"topics":        p.Topics,
 	}
 }
 
 func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
 	viewer := s.currentUser(r)
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	topic := normalizeTopic(r.URL.Query().Get("topic"))
+	if topic == "" && strings.HasPrefix(q, "remote:") {
+		topic = normalizeTopic(q)
+		q = ""
+	}
+	followed := r.URL.Query().Get("followed") == "1"
+	var remotes []string
+	if followed && viewer != nil {
+		remotes = s.store.RemotesFor(viewer.Handle)
+	}
 	feed := s.store.Feed()
 	out := []map[string]any{}
 	for i := range feed {
 		p := feed[i]
+		if topic != "" && !postHasTopic(&p, topic) {
+			continue
+		}
+		if followed {
+			hit := false
+			for _, t := range remotes {
+				if postHasTopic(&p, t) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				continue
+			}
+		}
 		if q != "" {
-			blob := strings.ToLower(p.Subject + " " + p.Body + " " + p.Owner)
+			blob := strings.ToLower(p.Subject + " " + p.Body + " " + p.Owner + " " + strings.Join(p.Topics, " "))
 			if !strings.Contains(blob, q) {
 				continue
 			}
@@ -231,7 +257,7 @@ func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
 		delete(item, "body")
 		out = append(out, item)
 	}
-	writeJSON(w, 200, map[string]any{"posts": out})
+	writeJSON(w, 200, map[string]any{"posts": out, "topic": topic, "remotes": remotes})
 }
 
 func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
@@ -250,9 +276,10 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Subject  string `json:"subject"`
-		Body     string `json:"body"`
-		StoryURL string `json:"storyUrl"`
+		Subject  string   `json:"subject"`
+		Body     string   `json:"body"`
+		StoryURL string   `json:"storyUrl"`
+		Topics   []string `json:"topics"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, errBadRequest)
@@ -267,7 +294,7 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 			story = &Story{URL: in.StoryURL, Provider: "link", HTMLURL: in.StoryURL}
 		}
 	}
-	p, err := s.store.CreatePost(u, in.Subject, in.Body, in.StoryURL, story, time.Time{})
+	p, err := s.store.CreatePost(u, in.Subject, in.Body, in.StoryURL, story, in.Topics, time.Time{})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -286,9 +313,10 @@ func (s *Server) handleUpdatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Subject  string `json:"subject"`
-		Body     string `json:"body"`
-		StoryURL string `json:"storyUrl"`
+		Subject  string   `json:"subject"`
+		Body     string   `json:"body"`
+		StoryURL string   `json:"storyUrl"`
+		Topics   []string `json:"topics"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, errBadRequest)
@@ -300,7 +328,7 @@ func (s *Server) handleUpdatePost(w http.ResponseWriter, r *http.Request) {
 			story = st
 		}
 	}
-	np, err := s.store.AmendPost(p.ID, u, in.Subject, in.Body, story)
+	np, err := s.store.AmendPost(p.ID, u, in.Subject, in.Body, story, in.Topics)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -686,6 +714,73 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		items = append(items, item)
 	}
 	writeJSON(w, 200, map[string]any{"user": u.Public(), "posts": items})
+}
+
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.store.Graph())
+}
+
+func (s *Server) handleTrending(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"trending": s.store.Trending(7 * 24 * time.Hour)})
+}
+
+func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"topics": s.store.TopicStats()})
+}
+
+func (s *Server) handleListRemotes(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"remotes": s.store.RemotesFor(u.Handle)})
+}
+
+func (s *Server) handleFollowRemote(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Topic string `json:"topic"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	list, err := s.store.FollowRemote(u.Handle, in.Topic)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"remotes": list})
+}
+
+func (s *Server) handleUnfollowRemote(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	list, err := s.store.UnfollowRemote(u.Handle, r.PathValue("topic"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"remotes": list})
+}
+
+func (s *Server) handleBlame(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	rows, err := s.store.Blame(p.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"blame": rows})
 }
 
 func (s *Server) handleStoryPreview(w http.ResponseWriter, r *http.Request) {

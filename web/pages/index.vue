@@ -60,6 +60,16 @@
       </article>
     </section>
 
+    <section v-if="user && remotePosts.length">
+      <div class="feed-head">
+        <h2>git fetch remotes</h2>
+        <span class="subtle mono">{{ remotes.map((r) => "remote:" + r).join("  ") }}</span>
+      </div>
+      <ol class="log-list">
+        <PostRow v-for="p in remotePosts" :key="'r' + p.id" :post="p" />
+      </ol>
+    </section>
+
     <section>
       <div class="feed-head">
         <h2>origin / main</h2>
@@ -77,6 +87,8 @@
 <script setup lang="ts">
 const { user, ready, refresh } = useAuth();
 const posts = ref<any[]>([]);
+const remotePosts = ref<any[]>([]);
+const remotes = ref<string[]>([]);
 const loading = ref(true);
 
 onMounted(async () => {
@@ -84,6 +96,18 @@ onMounted(async () => {
   try {
     const data = await api<{ posts: any[] }>("/api/feed");
     posts.value = data.posts || [];
+    if (user.value) {
+      try {
+        const r = await api<{ remotes: string[] }>("/api/remotes");
+        remotes.value = r.remotes || [];
+        if (remotes.value.length) {
+          const f = await api<{ posts: any[] }>("/api/feed?followed=1");
+          remotePosts.value = f.posts || [];
+        }
+      } catch {
+        remotes.value = [];
+      }
+    }
   } finally {
     loading.value = false;
   }

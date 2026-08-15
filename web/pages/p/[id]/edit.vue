@@ -14,6 +14,7 @@
         <label>Body</label>
         <WysimarkEditor ref="editor" v-model="body" placeholder="Amend the body. Markdown is welcome." />
       </div>
+      <TopicField v-model="topics" label="Remotes" placeholder="ai-safety, writing…" />
       <div class="row">
         <button class="btn btn-primary" type="submit" :disabled="busy">Commit amendment</button>
         <NuxtLink :to="`/p/${post.id}`" class="btn btn-ghost">Back</NuxtLink>
@@ -29,6 +30,7 @@ const flash = useFlash();
 const post = ref<any>(null);
 const subject = ref("");
 const body = ref("");
+const topics = ref<string[]>([]);
 const busy = ref(false);
 const editor = ref<{ getMarkdown: () => string } | null>(null);
 
@@ -38,6 +40,7 @@ onMounted(async () => {
   post.value = data.post;
   subject.value = data.post.subject;
   body.value = data.post.body;
+  topics.value = data.post.topics || [];
   if (!user.value || user.value.handle !== data.post.owner) {
     await navigateTo(`/p/${data.post.id}`);
   }
@@ -49,7 +52,7 @@ async function submit() {
     const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}`, {
       method: "PUT",
-      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: post.value.storyUrl }),
+      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: post.value.storyUrl, topics: topics.value }),
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {

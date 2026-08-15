@@ -43,6 +43,41 @@ function slugify(s: string): string {
   return out || "post";
 }
 
+function normalizeTopicName(s: string): string {
+  s = (s || "").toLowerCase().trim().replace(/^remote:/, "").replace(/^#/, "").trim();
+  if (!s) return "";
+  s = slugify(s);
+  if (s.length < 2 || s.length > 40) return "";
+  return s;
+}
+
+function parseTopics(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((t) => typeof t === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function extractTopics(explicit: string[] | undefined, subject: string, body: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (raw: string) => {
+    const t = normalizeTopicName(raw);
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  };
+  for (const t of explicit || []) add(t);
+  const blob = `${subject}\n${body || ""}`;
+  const re = /#([A-Za-z][A-Za-z0-9_-]{1,39})/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(blob))) add(m[1]);
+  return out.slice(0, 8);
+}
+
 function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
@@ -273,6 +308,20 @@ export class GitPostStore extends DurableObject<Env> {
         key TEXT PRIMARY KEY,
         value TEXT
       )`,
+      `CREATE TABLE IF NOT EXISTS remotes (
+        handle TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        created_at TEXT,
+        PRIMARY KEY (handle, topic)
+      )`,
+      `CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        kind TEXT,
+        post_id TEXT,
+        sha TEXT,
+        actor TEXT,
+        created_at TEXT
+      )`,
       `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
     ];
     for (const stmt of statements) {
@@ -288,6 +337,7 @@ export class GitPostStore extends DurableObject<Env> {
       "ALTER TABLE prs ADD COLUMN rationale TEXT",
       "ALTER TABLE prs ADD COLUMN review_note TEXT",
       "ALTER TABLE prs ADD COLUMN comments_json TEXT",
+      "ALTER TABLE posts ADD COLUMN topics_json TEXT",
     ]) {
       try {
         this.ctx.storage.sql.exec(extra);
@@ -445,7 +495,20 @@ export class GitPostStore extends DurableObject<Env> {
       updatedAt: p.updated_at,
       commitCount,
       forkCount,
+      topics: parseTopics(p.topics_json),
     };
+  }
+
+  private recordEvent(kind: string, postId: string, sha: string, actor: string) {
+    this.sql(
+      "INSERT INTO events (id, kind, post_id, sha, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      hex(4),
+      kind,
+      postId,
+      sha || "",
+      actor,
+      new Date().toISOString(),
+    );
   }
 
   private async commit(postId: string, user: User, subject: string, body: string, story: unknown, when: string, parentSha: string, branch = "main") {
@@ -479,13 +542,14 @@ export class GitPostStore extends DurableObject<Env> {
     return sha;
   }
 
-  private async createPost(user: User, subject: string, body: string, storyUrl: string, story: unknown, when?: string) {
+  private async createPost(user: User, subject: string, body: string, storyUrl: string, story: unknown, topics: string[] = [], when?: string) {
     subject = subject.trim();
     if (!subject) throw new Error("bad request");
     const id = hex(5);
     const ts = when || new Date().toISOString();
+    const topicList = extractTopics(topics, subject, body);
     this.sql(
-      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, story_json, story_url, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', '', '', ?, ?, 'main', ?, ?)",
+      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, story_json, story_url, default_branch, created_at, updated_at, topics_json) VALUES (?, ?, ?, ?, ?, '', '', '', ?, ?, 'main', ?, ?, ?)",
       id,
       user.handle,
       subject,
@@ -495,17 +559,22 @@ export class GitPostStore extends DurableObject<Env> {
       storyUrl || "",
       ts,
       ts,
+      JSON.stringify(topicList),
     );
-    await this.commit(id, user, subject, body || "", story, ts, "");
+    const sha = await this.commit(id, user, subject, body || "", story, ts, "");
+    this.recordEvent("commit", id, sha, user.handle);
     return this.findPost(id)!;
   }
 
-  private async amendPost(id: string, user: User, subject: string, body: string, story: unknown) {
+  private async amendPost(id: string, user: User, subject: string, body: string, story: unknown, topics?: string[]) {
     const p = this.findPost(id);
     if (!p) throw new Error("not found");
     if (p.owner !== user.handle) throw new Error("forbidden");
     const ts = new Date().toISOString();
-    await this.commit(p.id, user, subject.trim() || p.subject, body, story, ts, p.head_sha, p.default_branch || "main");
+    const sha = await this.commit(p.id, user, subject.trim() || p.subject, body, story, ts, p.head_sha, p.default_branch || "main");
+    const topicList = extractTopics(topics || parseTopics(p.topics_json), subject.trim() || p.subject, body);
+    this.sql("UPDATE posts SET topics_json = ? WHERE id = ?", JSON.stringify(topicList), p.id);
+    this.recordEvent("commit", p.id, sha, user.handle);
     return this.findPost(p.id)!;
   }
 
@@ -517,7 +586,7 @@ export class GitPostStore extends DurableObject<Env> {
     const nid = hex(5);
     const ts = new Date().toISOString();
     this.sql(
-      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, fork_intent, fork_intent_note, story_json, story_url, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'main', ?, ?)",
+      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, fork_intent, fork_intent_note, story_json, story_url, default_branch, created_at, updated_at, topics_json) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'main', ?, ?, ?)",
       nid,
       user.handle,
       src.subject,
@@ -531,6 +600,7 @@ export class GitPostStore extends DurableObject<Env> {
       src.story_url,
       ts,
       ts,
+      src.topics_json || "[]",
     );
     const commits = this.sql<any>("SELECT * FROM commits WHERE post_id = ? ORDER BY created_at ASC", src.id);
     let last = "";
@@ -552,6 +622,8 @@ export class GitPostStore extends DurableObject<Env> {
     }
     const forkSha = await this.commit(nid, user, "fork(" + intent + "): " + src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null, ts, last);
     this.sql("UPDATE posts SET head_sha = ? WHERE id = ?", forkSha, nid);
+    this.recordEvent("fork", src.id, src.head_sha, user.handle);
+    this.recordEvent("fork", nid, forkSha, user.handle);
     return this.findPost(nid)!;
   }
 
@@ -618,6 +690,7 @@ export class GitPostStore extends DurableObject<Env> {
       ts,
       ts,
     );
+    this.recordEvent("pr", dst.id, dst.head_sha, user.handle);
     return this.one<any>("SELECT * FROM prs WHERE id = ?", id);
   }
 
@@ -827,6 +900,138 @@ export class GitPostStore extends DurableObject<Env> {
     return err(404, "not found");
   }
 
+  private buildGraph() {
+    const posts = this.sql<any>("SELECT * FROM posts ORDER BY updated_at DESC");
+    const prs = this.sql<any>("SELECT * FROM prs WHERE status = 'merged' AND IFNULL(kind,'full') != 'paragraph'");
+    const keep = new Set<string>();
+    posts.slice(0, 80).forEach((p) => keep.add(p.id));
+    for (const p of posts) {
+      if (keep.has(p.id) && p.parent_post_id) keep.add(p.parent_post_id);
+    }
+    const mergedInto = new Map<string, string[]>();
+    for (const pr of prs) {
+      keep.add(pr.target_post_id);
+      keep.add(pr.source_post_id);
+      const list = mergedInto.get(pr.target_post_id) || [];
+      list.push(pr.source_post_id);
+      mergedInto.set(pr.target_post_id, list);
+    }
+    const nodes = posts
+      .filter((p) => keep.has(p.id))
+      .map((p) => {
+        const parents: string[] = [];
+        if (p.parent_post_id) parents.push(p.parent_post_id);
+        const extras = mergedInto.get(p.id) || [];
+        parents.push(...extras);
+        let kind = p.parent_post_id ? "fork" : "commit";
+        if (extras.length) kind = "merge";
+        const stars = this.sql<{ handle: string }>("SELECT handle FROM stars WHERE post_id = ?", p.id);
+        const forkCount = this.one<{ n: number }>("SELECT COUNT(*) as n FROM posts WHERE parent_post_id = ?", p.id)?.n || 0;
+        const commitCount = this.one<{ n: number }>("SELECT COUNT(*) as n FROM commits WHERE post_id = ?", p.id)?.n || 0;
+        return {
+          id: p.id,
+          owner: p.owner,
+          subject: p.subject,
+          shortSha: shortSha(p.head_sha || ""),
+          headSha: p.head_sha,
+          parentPostId: p.parent_post_id || "",
+          forkIntent: p.fork_intent || "",
+          forkCount,
+          starCount: stars.length,
+          commitCount,
+          topics: parseTopics(p.topics_json),
+          updatedAt: p.updated_at,
+          kind,
+          parents,
+        };
+      });
+    return { nodes };
+  }
+
+  private buildTrending() {
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    const by = new Map<string, { forks: number; prs: number; cherries: number; merges: number }>();
+    const touch = (id: string) => {
+      if (!by.has(id)) by.set(id, { forks: 0, prs: 0, cherries: 0, merges: 0 });
+      return by.get(id)!;
+    };
+    for (const ev of this.sql<any>("SELECT * FROM events WHERE created_at >= ?", since)) {
+      const sc = touch(ev.post_id);
+      if (ev.kind === "fork") sc.forks++;
+      else if (ev.kind === "pr") sc.prs++;
+      else if (ev.kind === "cherry") sc.cherries++;
+      else if (ev.kind === "merge") sc.merges++;
+    }
+    for (const p of this.sql<any>("SELECT * FROM posts WHERE parent_post_id != '' AND created_at >= ?", since)) {
+      touch(p.parent_post_id).forks++;
+      touch(p.id);
+    }
+    for (const pr of this.sql<any>("SELECT * FROM prs WHERE created_at >= ?", since)) {
+      touch(pr.target_post_id).prs++;
+      if (pr.status === "merged" && pr.updated_at >= since) touch(pr.target_post_id).merges++;
+    }
+    const rows = [...by.entries()]
+      .map(([id, sc]) => ({
+        id,
+        sc,
+        total: sc.forks * 4 + sc.prs * 3 + sc.cherries * 3 + sc.merges * 2,
+      }))
+      .filter((r) => r.total > 0 && this.findPost(r.id))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 12);
+    return rows.map((r) => {
+      const p = this.findPost(r.id)!;
+      return {
+        id: p.id,
+        subject: p.subject,
+        owner: p.owner,
+        shortSha: shortSha(p.head_sha || ""),
+        headSha: p.head_sha,
+        score: r.total,
+        forks: r.sc.forks,
+        prs: r.sc.prs,
+        cherries: r.sc.cherries,
+        merges: r.sc.merges,
+        topics: parseTopics(p.topics_json),
+        forkIntent: p.fork_intent || "",
+        parentPostId: p.parent_post_id || "",
+      };
+    });
+  }
+
+  private blamePost(p: any) {
+    const hist = this.sql<any>("SELECT * FROM commits WHERE post_id = ? ORDER BY created_at DESC", p.id);
+    const snaps = hist.map((c: any) => ({ c, paras: splitParagraphs(c.body || "") }));
+    if (!snaps.length) {
+      return splitParagraphs(p.body || "").map((text, index) => ({
+        index,
+        text,
+        author: p.owner,
+        sha: p.head_sha,
+        shortSha: shortSha(p.head_sha || ""),
+        date: p.updated_at,
+        subject: p.subject,
+      }));
+    }
+    const head = snaps[0];
+    return head.paras.map((para: string, i: number) => {
+      let blamed = head.c;
+      for (let j = 1; j < snaps.length; j++) {
+        if (snaps[j].paras.includes(para)) blamed = snaps[j].c;
+        else break;
+      }
+      return {
+        index: i,
+        text: para,
+        author: blamed.author,
+        sha: blamed.sha,
+        shortSha: shortSha(blamed.sha),
+        date: blamed.created_at,
+        subject: blamed.subject,
+      };
+    });
+  }
+
   async fetch(req: Request): Promise<Response> {
     await this.ready;
     const url = new URL(req.url);
@@ -895,10 +1100,26 @@ export class GitPostStore extends DurableObject<Env> {
       }
 
       if (path === "/api/feed" && method === "GET") {
-        const q = (url.searchParams.get("q") || "").toLowerCase();
+        let q = (url.searchParams.get("q") || "").toLowerCase();
+        let topic = normalizeTopicName(url.searchParams.get("topic") || "");
+        if (!topic && q.startsWith("remote:")) {
+          topic = normalizeTopicName(q);
+          q = "";
+        }
+        const followed = url.searchParams.get("followed") === "1";
+        let remotes: string[] = [];
+        if (followed && viewer) {
+          remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
+        }
         let posts = this.sql<any>("SELECT * FROM posts ORDER BY updated_at DESC");
+        if (topic) {
+          posts = posts.filter((p) => parseTopics(p.topics_json).includes(topic));
+        }
+        if (followed) {
+          posts = posts.filter((p) => parseTopics(p.topics_json).some((t) => remotes.includes(t)));
+        }
         if (q) {
-          posts = posts.filter((p) => `${p.subject} ${p.body} ${p.owner}`.toLowerCase().includes(q));
+          posts = posts.filter((p) => `${p.subject} ${p.body} ${p.owner} ${p.topics_json || ""}`.toLowerCase().includes(q));
         }
         return json({
           posts: posts.map((p) => {
@@ -906,7 +1127,47 @@ export class GitPostStore extends DurableObject<Env> {
             delete (item as any).body;
             return item;
           }),
+          topic,
+          remotes,
         });
+      }
+
+      if (path === "/api/graph" && method === "GET") {
+        return json(this.buildGraph());
+      }
+      if (path === "/api/trending" && method === "GET") {
+        return json({ trending: this.buildTrending() });
+      }
+      if (path === "/api/topics" && method === "GET") {
+        const counts = new Map<string, number>();
+        for (const p of this.sql<any>("SELECT topics_json FROM posts")) {
+          for (const t of parseTopics(p.topics_json)) counts.set(t, (counts.get(t) || 0) + 1);
+        }
+        const topics = [...counts.entries()]
+          .map(([topic, count]) => ({ topic, count }))
+          .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic));
+        return json({ topics });
+      }
+      if (path === "/api/remotes" && method === "GET") {
+        if (!viewer) return err(401, "unauthorized");
+        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ? ORDER BY topic", viewer.handle).map((r) => r.topic);
+        return json({ remotes });
+      }
+      if (path === "/api/remotes" && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        const topic = normalizeTopicName(inb.topic || "");
+        if (!topic) return err(400, "bad request");
+        this.sql("INSERT OR IGNORE INTO remotes (handle, topic, created_at) VALUES (?, ?, ?)", viewer.handle, topic, new Date().toISOString());
+        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
+        return json({ remotes });
+      }
+      const unf = path.match(/^\/api\/remotes\/([^/]+)$/);
+      if (unf && method === "DELETE") {
+        if (!viewer) return err(401, "unauthorized");
+        this.sql("DELETE FROM remotes WHERE handle = ? AND topic = ?", viewer.handle, normalizeTopicName(decodeURIComponent(unf[1])));
+        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
+        return json({ remotes });
       }
 
       if (path === "/api/posts" && method === "POST") {
@@ -914,7 +1175,7 @@ export class GitPostStore extends DurableObject<Env> {
         const inb = await req.json<any>();
         let story = null;
         if (inb.storyUrl) story = await fetchStory(inb.storyUrl);
-        const p = await this.createPost(viewer, inb.subject, inb.body || "", inb.storyUrl || "", story);
+        const p = await this.createPost(viewer, inb.subject, inb.body || "", inb.storyUrl || "", story, inb.topics || []);
         return json({ post: this.postPayload(p, viewer) }, 201);
       }
 
@@ -932,7 +1193,7 @@ export class GitPostStore extends DurableObject<Env> {
           const inb = await req.json<any>();
           let story = p.story_json ? JSON.parse(p.story_json) : null;
           if (inb.storyUrl && inb.storyUrl !== p.story_url) story = await fetchStory(inb.storyUrl);
-          const np = await this.amendPost(p.id, viewer, inb.subject, inb.body, story);
+          const np = await this.amendPost(p.id, viewer, inb.subject, inb.body, story, inb.topics);
           return json({ post: this.postPayload(np, viewer) });
         }
 
@@ -1046,6 +1307,10 @@ export class GitPostStore extends DurableObject<Env> {
           });
         }
 
+        if (rest === "blame" && method === "GET") {
+          return json({ blame: this.blamePost(p) });
+        }
+
         if (rest === "branches" && method === "GET") {
           const list = this.sql<any>("SELECT * FROM branches WHERE post_id = ?", p.id).map((b) => ({
             name: b.name,
@@ -1098,6 +1363,7 @@ export class GitPostStore extends DurableObject<Env> {
             return err(409, "that commit is already in this history");
           }
           const np = await this.amendPost(p.id, viewer, c.subject, c.body, c.story_json ? JSON.parse(c.story_json) : null);
+          this.recordEvent("cherry", p.id, np.head_sha, viewer.handle);
           return json({ post: this.postPayload(np, viewer) });
         }
       }
@@ -1177,12 +1443,14 @@ export class GitPostStore extends DurableObject<Env> {
               dst.head_sha,
             );
             this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+            this.recordEvent("merge", dst.id, sha, viewer.handle);
             return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
           }
           const src = this.findPost(pr.source_post_id);
           if (!src) return err(404, "not found");
           const sha = await this.commit(dst.id, viewer, `Merge PR #${pr.number}: ${pr.title}`, src.body, src.story_json ? JSON.parse(src.story_json) : null, new Date().toISOString(), dst.head_sha);
           this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+          this.recordEvent("merge", dst.id, sha, viewer.handle);
           return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
         }
 
