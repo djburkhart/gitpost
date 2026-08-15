@@ -30,3 +30,12 @@ npx wrangler deploy
 ```
 
 Do not commit `.dev.vars` or `data/.admin-password`.
+
+## GitHub Actions
+
+Required repository secrets:
+
+- `CLOUDFLARE_API_TOKEN` — token with Workers edit
+- `CLOUDFLARE_ACCOUNT_ID` — from the Cloudflare dashboard (Workers overview)
+
+If the account ID secret is missing, the workflow tries to resolve it from the token.
