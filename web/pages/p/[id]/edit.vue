@@ -11,8 +11,8 @@
         <input id="subject" v-model="subject" class="subject-input" required />
       </div>
       <div class="field">
-        <label for="body">Body</label>
-        <textarea id="body" v-model="body" />
+        <label>Body</label>
+        <WysimarkEditor ref="editor" v-model="body" placeholder="Amend the body. Markdown is welcome." />
       </div>
       <p v-if="error" style="color: var(--del)">{{ error }}</p>
       <div class="row">
@@ -31,6 +31,7 @@ const subject = ref("");
 const body = ref("");
 const error = ref("");
 const busy = ref(false);
+const editor = ref<{ getMarkdown: () => string } | null>(null);
 
 onMounted(async () => {
   if (!ready.value) await refresh();
@@ -47,9 +48,10 @@ async function submit() {
   busy.value = true;
   error.value = "";
   try {
+    const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}`, {
       method: "PUT",
-      body: JSON.stringify({ subject: subject.value, body: body.value, storyUrl: post.value.storyUrl }),
+      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: post.value.storyUrl }),
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {

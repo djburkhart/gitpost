@@ -986,3 +986,20 @@ table.data th {
   padding: 10px 12px;
   min-height: 44px;
 }
+
+.wysimark-shell {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: #f6f5f0;
+  color: #161615;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.wysimark-host {
+  min-height: 280px;
+}
+
+.wysimark-shell :focus-visible {
+  outline-color: #3d3d38;
+}

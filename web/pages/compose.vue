@@ -20,8 +20,8 @@
         />
       </div>
       <div class="field">
-        <label for="body">Body</label>
-        <textarea id="body" v-model="body" placeholder="Why this exists. Markdown is fine." />
+        <label>Body</label>
+        <WysimarkEditor ref="editor" v-model="body" placeholder="Why this exists. Write in Markdown — headings, lists, code, tables." />
       </div>
       <details style="margin-bottom: 24px">
         <summary class="muted" style="cursor: pointer; font-size: 0.9rem">Story mode — embed a GitHub or GitLab commit / PR</summary>
@@ -48,6 +48,7 @@ const storyUrl = ref("");
 const story = ref<any>(null);
 const error = ref("");
 const busy = ref(false);
+const editor = ref<{ getMarkdown: () => string } | null>(null);
 
 onMounted(async () => {
   if (!ready.value) await refresh();
@@ -73,9 +74,10 @@ async function submit() {
   error.value = "";
   busy.value = true;
   try {
+    const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>("/api/posts", {
       method: "POST",
-      body: JSON.stringify({ subject: subject.value, body: body.value, storyUrl: storyUrl.value }),
+      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: storyUrl.value }),
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {
