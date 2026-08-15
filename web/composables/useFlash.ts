@@ -17,6 +17,24 @@ export function friendlyError(raw: string): { title: string; detail?: string } {
       detail: "That commit is already applied here — nothing new to cherry-pick.",
     };
   }
+  if (lower.includes("protected")) {
+    return {
+      title: "Main is protected",
+      detail: "Only the author or a maintainer can push. Open a pull request.",
+    };
+  }
+  if (lower.includes("reviews are still pending") || lower.includes("still a draft")) {
+    return {
+      title: "Reviews pending",
+      detail: "Requested reviewers need to approve before this hits main.",
+    };
+  }
+  if (lower.includes("conflict markers")) {
+    return {
+      title: "Unresolved conflict",
+      detail: "Edit the markers into one claim, then resolve.",
+    };
+  }
   if (lower.includes("paragraph has changed")) {
     return {
       title: "Paragraph moved on",

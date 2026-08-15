@@ -87,6 +87,12 @@ func main() {
 	mux.HandleFunc("GET /api/posts/{id}/comments", s.handleListComments)
 	mux.HandleFunc("POST /api/posts/{id}/comments", s.handleAddComment)
 	mux.HandleFunc("POST /api/posts/{id}/comments/{cid}/branch", s.handleBranchDiscussion)
+	mux.HandleFunc("POST /api/posts/{id}/coauthors", s.handleInviteCoAuthor)
+	mux.HandleFunc("POST /api/posts/{id}/coauthors/accept", s.handleAcceptCoAuthor)
+	mux.HandleFunc("DELETE /api/posts/{id}/coauthors/{handle}", s.handleRemoveCoAuthor)
+	mux.HandleFunc("POST /api/posts/{id}/protect", s.handleProtect)
+	mux.HandleFunc("POST /api/posts/{id}/reviewers", s.handleRequestReview)
+	mux.HandleFunc("POST /api/posts/{id}/review", s.handleSubmitReview)
 
 	mux.HandleFunc("GET /api/prs", s.handleListPRs)
 	mux.HandleFunc("POST /api/prs", s.handleCreatePR)
@@ -94,6 +100,9 @@ func main() {
 	mux.HandleFunc("POST /api/prs/{id}/merge", s.handleMergePR)
 	mux.HandleFunc("POST /api/prs/{id}/close", s.handleClosePR)
 	mux.HandleFunc("POST /api/prs/{id}/comment", s.handleCommentPR)
+	mux.HandleFunc("POST /api/prs/{id}/reviewers", s.handleRequestReview)
+	mux.HandleFunc("POST /api/prs/{id}/review", s.handleSubmitReview)
+	mux.HandleFunc("POST /api/prs/{id}/resolve", s.handleResolvePR)
 
 	mux.HandleFunc("GET /api/users/{handle}", s.handleUser)
 	mux.HandleFunc("GET /api/story/preview", s.handleStoryPreview)

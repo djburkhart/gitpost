@@ -70,8 +70,8 @@ func (s *Store) CherryPickExcerpt(destID, sourceID, excerpt string, user *User) 
 	if dst == nil {
 		return nil, errNotFound
 	}
-	if dst.Owner != user.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(dst, user); err != nil {
+		return nil, err
 	}
 	body := strings.TrimSpace(dst.Body)
 	if body != "" {

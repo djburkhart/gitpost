@@ -127,6 +127,11 @@ type Post struct {
 	CommitCount   int       `json:"commitCount"`
 	ForkCount     int       `json:"forkCount"`
 	Topics        []string  `json:"topics,omitempty"`
+	CoAuthors       []string         `json:"coAuthors,omitempty"`
+	CoAuthorInvites []string         `json:"coAuthorInvites,omitempty"`
+	Maintainers     []string         `json:"maintainers,omitempty"`
+	Protected       bool             `json:"protected"`
+	Reviewers       []ReviewRequest  `json:"reviewers,omitempty"`
 }
 
 type Story struct {
@@ -152,6 +157,7 @@ type CommitInfo struct {
 	Email     string    `json:"email"`
 	Date      time.Time `json:"date"`
 	Parents   []string  `json:"parents"`
+	Trailers  []string  `json:"trailers,omitempty"`
 }
 
 type PullRequest struct {
@@ -173,6 +179,9 @@ type PullRequest struct {
 	Rationale    string     `json:"rationale,omitempty"`
 	ReviewNote   string     `json:"reviewNote,omitempty"`
 	Comments     []PRComment `json:"comments,omitempty"`
+	Reviewers    []ReviewRequest `json:"reviewers,omitempty"`
+	Draft        bool       `json:"draft,omitempty"`
+	ConflictBody string     `json:"conflictBody,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
 	UpdatedAt    time.Time  `json:"updatedAt"`
 }
@@ -459,7 +468,7 @@ func parsePostFile(raw string) (subject, body string, story *Story) {
 	return "", raw, story
 }
 
-func (s *Store) commit(repo, name, email, subject string, when time.Time) (string, error) {
+func (s *Store) commit(repo, name, email, subject string, when time.Time, extra ...string) (string, error) {
 	if _, err := s.git(repo, "add", "POST.md"); err != nil {
 		return "", err
 	}
@@ -473,7 +482,11 @@ func (s *Store) commit(repo, name, email, subject string, when time.Time) (strin
 		ts := when.Format(time.RFC3339)
 		env = append(env, "GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts)
 	}
-	if _, err := s.gitEnv(repo, env, "commit", "--allow-empty", "-m", subject); err != nil {
+	args := []string{"commit", "--allow-empty", "-m", subject}
+	if len(extra) > 0 && strings.TrimSpace(extra[0]) != "" {
+		args = append(args, "-m", extra[0])
+	}
+	if _, err := s.gitEnv(repo, env, args...); err != nil {
 		return "", err
 	}
 	sha, err := s.git(repo, "rev-parse", "HEAD")
@@ -741,15 +754,15 @@ func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *S
 	return p, s.save()
 }
 
-func (s *Store) AmendPost(id string, editor *User, subject, body string, story *Story, topics []string) (*Post, error) {
+func (s *Store) AmendPost(id string, editor *User, subject, body string, story *Story, topics []string, signoff bool) (*Post, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.posts[id]
 	if p == nil {
 		return nil, errNotFound
 	}
-	if p.Owner != editor.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(p, editor); err != nil {
+		return nil, err
 	}
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
@@ -759,7 +772,7 @@ func (s *Store) AmendPost(id string, editor *User, subject, body string, story *
 	if err := writePostFile(dir, subject, body, story); err != nil {
 		return nil, err
 	}
-	sha, err := s.commit(dir, editor.Name, editor.Email, subject, time.Now().UTC())
+	sha, err := s.commit(dir, editor.Name, editor.Email, subject, time.Now().UTC(), s.trailerBlock(p, editor, signoff))
 	if err != nil {
 		return nil, err
 	}
@@ -859,6 +872,7 @@ func (s *Store) History(id string) ([]CommitInfo, error) {
 		if len(parts) > 5 {
 			body = strings.TrimSpace(parts[5])
 		}
+		clean, trailers := parseTrailers(body)
 		commits = append(commits, CommitInfo{
 			SHA:      parts[0],
 			ShortSHA: shortSHA(parts[0]),
@@ -866,7 +880,8 @@ func (s *Store) History(id string) ([]CommitInfo, error) {
 			Email:    parts[2],
 			Date:     dt,
 			Subject:  parts[4],
-			Body:     body,
+			Body:     clean,
+			Trailers: trailers,
 		})
 	}
 	return commits, nil
@@ -1033,8 +1048,8 @@ func (s *Store) CreateBranch(id, name, from string, user *User) (*BranchInfo, er
 	if p == nil {
 		return nil, errNotFound
 	}
-	if p.Owner != user.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(p, user); err != nil {
+		return nil, err
 	}
 	name = slugify(name)
 	if name == "" || name == "main" {
@@ -1058,8 +1073,8 @@ func (s *Store) CheckoutBranch(id, name string, user *User) error {
 	if p == nil {
 		return errNotFound
 	}
-	if p.Owner != user.Handle {
-		return errForbidden
+	if err := s.writeDenied(p, user); err != nil {
+		return err
 	}
 	if _, err := s.git(s.repoDir(id), "checkout", name); err != nil {
 		return err
@@ -1077,8 +1092,8 @@ func (s *Store) CherryPick(id, sha string, user *User) (*Post, error) {
 	if p == nil {
 		return nil, errNotFound
 	}
-	if p.Owner != user.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(p, user); err != nil {
+		return nil, err
 	}
 	dir := s.repoDir(id)
 	env := []string{
@@ -1105,8 +1120,8 @@ func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Pos
 	if dst == nil || src == nil {
 		return nil, errNotFound
 	}
-	if dst.Owner != user.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(dst, user); err != nil {
+		return nil, err
 	}
 	// fetch source object into dest via a temporary remote
 	dir := s.repoDir(targetID)
@@ -1214,6 +1229,12 @@ func (s *Store) OpenPR(author *User, title, body, sourceID, targetID, kind strin
 		pr.SourcePostID = sourceID
 		pr.SourceSHA = src.HeadSHA
 		pr.TargetSHA = dst.HeadSHA
+		if len(src.Reviewers) > 0 {
+			pr.Reviewers = append([]ReviewRequest{}, src.Reviewers...)
+		}
+		if len(pr.Reviewers) > 0 && !reviewsReady(pr.Reviewers) {
+			pr.Draft = true
+		}
 	}
 	s.prSeq++
 	pr.Number = s.prSeq
@@ -1262,30 +1283,44 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 	if dst == nil {
 		return nil, errNotFound
 	}
-	if dst.Owner != user.Handle {
-		return nil, errForbidden
+	if err := s.writeDenied(dst, user); err != nil {
+		return nil, err
 	}
-	if pr.Status != "open" {
+	if pr.Status != "open" && pr.Status != "conflict" {
 		return nil, errConflict
+	}
+	if pr.Draft {
+		return nil, errDraftPR
+	}
+	if !reviewsReady(pr.Reviewers) {
+		return nil, errReviewsPending
 	}
 	if pr.Kind == "paragraph" {
 		next, err := applyParagraph(dst.Body, pr.ParagraphIndex, pr.Original, pr.Proposed)
 		if err != nil {
-			return nil, err
+			oursLabel := "yours (@" + dst.Owner + " — current main)"
+			theirsLabel := "incoming from @" + pr.Author
+			block := "<<<<<<< " + oursLabel + "\n" + pr.Original + "\n=======\n" + pr.Proposed + "\n>>>>>>> " + theirsLabel
+			pr.Status = "conflict"
+			pr.ConflictBody = block
+			pr.UpdatedAt = time.Now().UTC()
+			return pr, s.save()
 		}
 		dir := s.repoDir(dst.ID)
 		if err := writePostFile(dir, dst.Subject, next, dst.Story); err != nil {
 			return nil, err
 		}
-		sha, err := s.commit(dir, user.Name, user.Email, "Accept paragraph from @"+pr.Author+": "+pr.Title, time.Now().UTC())
+		sha, err := s.commit(dir, user.Name, user.Email, "Accept paragraph from @"+pr.Author+": "+pr.Title, time.Now().UTC(), s.trailerBlock(dst, user, true))
 		if err != nil {
 			return nil, err
 		}
 		pr.MergedSHA = sha
 		pr.Status = "merged"
+		pr.ConflictBody = ""
 		pr.UpdatedAt = time.Now().UTC()
 		s.refreshPost(dst)
 		dst.UpdatedAt = pr.UpdatedAt
+		s.recordLocked("merge", dst.ID, sha, user.Handle)
 		return pr, s.save()
 	}
 	src := s.posts[pr.SourcePostID]
@@ -1293,44 +1328,51 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 		return nil, errNotFound
 	}
 	dir := s.repoDir(dst.ID)
-	remote := "pr-" + pr.ID
-	_, _ = s.git(dir, "remote", "remove", remote)
-	if _, err := s.git(dir, "remote", "add", remote, s.repoDir(src.ID)); err != nil {
+	oursRaw, _ := s.readBlob(dst.ID, "")
+	theirsBytes, rerr := os.ReadFile(filepath.Join(s.repoDir(src.ID), "POST.md"))
+	if rerr != nil {
+		return nil, rerr
+	}
+	baseRaw := ""
+	if src.ForkedFromSHA != "" {
+		if b, err := s.readBlob(dst.ID, src.ForkedFromSHA); err == nil {
+			baseRaw = b
+		}
+	}
+	if baseRaw == "" && pr.TargetSHA != "" {
+		if b, err := s.readBlob(dst.ID, pr.TargetSHA); err == nil {
+			baseRaw = b
+		}
+	}
+	if baseRaw == "" {
+		baseRaw = oursRaw
+	}
+	oursLabel := "yours (@" + dst.Owner + " — current main)"
+	theirsLabel := "incoming from @" + pr.Author + " (PR #" + fmt.Sprint(pr.Number) + ")"
+	merged, conflicted, merr := ideaMerge(baseRaw, oursRaw, string(theirsBytes), oursLabel, theirsLabel)
+	if merr != nil {
+		return nil, merr
+	}
+	if conflicted {
+		pr.Status = "conflict"
+		pr.ConflictBody = merged
+		pr.UpdatedAt = time.Now().UTC()
+		return pr, s.save()
+	}
+	if err := os.WriteFile(filepath.Join(dir, "POST.md"), []byte(merged), 0o644); err != nil {
 		return nil, err
 	}
-	if _, err := s.git(dir, "fetch", remote); err != nil {
+	sha, err := s.commit(dir, user.Name, user.Email, "Merge PR #"+fmt.Sprint(pr.Number)+": "+pr.Title, time.Now().UTC(), s.trailerBlock(dst, user, true))
+	if err != nil {
 		return nil, err
 	}
-	env := []string{
-		"GIT_AUTHOR_NAME=" + user.Name,
-		"GIT_AUTHOR_EMAIL=" + user.Email,
-		"GIT_COMMITTER_NAME=" + user.Name,
-		"GIT_COMMITTER_EMAIL=" + user.Email,
-	}
-	// merge the forked tip
-	if _, err := s.gitEnv(dir, env, "merge", "--no-ff", "-m", "Merge PR #"+fmt.Sprint(pr.Number)+": "+pr.Title, "FETCH_HEAD"); err != nil {
-		// fallback: take their POST.md as ours
-		raw, rerr := os.ReadFile(filepath.Join(s.repoDir(src.ID), "POST.md"))
-		if rerr != nil {
-			return nil, err
-		}
-		_, _ = s.git(dir, "merge", "--abort")
-		if werr := os.WriteFile(filepath.Join(dir, "POST.md"), raw, 0o644); werr != nil {
-			return nil, werr
-		}
-		sha, cerr := s.commit(dir, user.Name, user.Email, "Merge PR #"+fmt.Sprint(pr.Number)+": "+pr.Title, time.Now().UTC())
-		if cerr != nil {
-			return nil, cerr
-		}
-		pr.MergedSHA = sha
-	} else {
-		pr.MergedSHA = s.headSHA(dst.ID)
-	}
+	pr.MergedSHA = sha
 	pr.Status = "merged"
+	pr.ConflictBody = ""
 	pr.UpdatedAt = time.Now().UTC()
 	s.refreshPost(dst)
 	dst.UpdatedAt = pr.UpdatedAt
-	s.recordLocked("merge", dst.ID, pr.MergedSHA, user.Handle)
+	s.recordLocked("merge", dst.ID, sha, user.Handle)
 	return pr, s.save()
 }
 

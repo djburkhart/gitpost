@@ -23,8 +23,14 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 	case errors.Is(err, errForbidden):
 		writeJSON(w, 403, map[string]string{"error": "forbidden"})
-	case errors.Is(err, errConflict):
-		writeJSON(w, 409, map[string]string{"error": "conflict"})
+	case errors.Is(err, errProtectedMain):
+		writeJSON(w, 403, map[string]string{"error": "main is protected — open a pull request"})
+	case errors.Is(err, errReviewsPending):
+		writeJSON(w, 409, map[string]string{"error": "requested reviews are still pending"})
+	case errors.Is(err, errDraftPR):
+		writeJSON(w, 409, map[string]string{"error": "this is still a draft — mark it ready after reviews"})
+	case errors.Is(err, errUnresolved):
+		writeJSON(w, 400, map[string]string{"error": "resolve the conflict markers before merging"})
 	case errors.Is(err, errBadRequest):
 		writeJSON(w, 400, map[string]string{"error": "bad request"})
 	case errors.Is(err, errLocked):
@@ -212,6 +218,13 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"commitCount":   p.CommitCount,
 		"forkCount":     p.ForkCount,
 		"topics":        p.Topics,
+		"coAuthors":     p.CoAuthors,
+		"coAuthorInvites": p.CoAuthorInvites,
+		"maintainers":   p.Maintainers,
+		"protected":     p.Protected,
+		"reviewers":     p.Reviewers,
+		"canPush":       canPushUser(p, viewer),
+		"invited":       viewer != nil && containsHandle(p.CoAuthorInvites, viewer.Handle),
 	}
 }
 
@@ -317,6 +330,7 @@ func (s *Server) handleUpdatePost(w http.ResponseWriter, r *http.Request) {
 		Body     string   `json:"body"`
 		StoryURL string   `json:"storyUrl"`
 		Topics   []string `json:"topics"`
+		Signoff  *bool    `json:"signoff"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, errBadRequest)
@@ -328,7 +342,11 @@ func (s *Server) handleUpdatePost(w http.ResponseWriter, r *http.Request) {
 			story = st
 		}
 	}
-	np, err := s.store.AmendPost(p.ID, u, in.Subject, in.Body, story, in.Topics)
+	signoff := true
+	if in.Signoff != nil {
+		signoff = *in.Signoff
+	}
+	np, err := s.store.AmendPost(p.ID, u, in.Subject, in.Body, story, in.Topics, signoff)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -633,7 +651,15 @@ func (s *Server) handleGetPR(w http.ResponseWriter, r *http.Request) {
 	diff, _ := s.store.PRDiff(pr)
 	src := s.store.FindPost(pr.SourcePostID)
 	dst := s.store.FindPost(pr.TargetPostID)
-	writeJSON(w, 200, map[string]any{"pr": pr, "diff": diff, "source": src, "target": dst})
+	viewer := s.currentUser(r)
+	var srcP, dstP any
+	if src != nil {
+		srcP = postPayload(src, viewer)
+	}
+	if dst != nil {
+		dstP = postPayload(dst, viewer)
+	}
+	writeJSON(w, 200, map[string]any{"pr": pr, "diff": diff, "source": srcP, "target": dstP})
 }
 
 func (s *Server) handleMergePR(w http.ResponseWriter, r *http.Request) {
@@ -786,6 +812,150 @@ func (s *Server) handleBranchDiscussion(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, 201, map[string]any{"branch": b})
+}
+
+func (s *Server) handleInviteCoAuthor(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Handle string `json:"handle"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	p, err := s.store.InviteCoAuthor(r.PathValue("id"), in.Handle, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleAcceptCoAuthor(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	p, err := s.store.AcceptCoAuthor(r.PathValue("id"), u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleRemoveCoAuthor(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	p, err := s.store.RemoveCoAuthor(r.PathValue("id"), r.PathValue("handle"), u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleProtect(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Protected   bool     `json:"protected"`
+		Maintainers []string `json:"maintainers"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	p, err := s.store.SetProtection(r.PathValue("id"), in.Protected, in.Maintainers, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleRequestReview(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Handle string `json:"handle"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	kind := "post"
+	if strings.Contains(r.URL.Path, "/api/prs/") {
+		kind = "pr"
+	}
+	if err := s.store.RequestReview(kind, r.PathValue("id"), in.Handle, u.Handle); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if kind == "pr" {
+		writeJSON(w, 200, map[string]any{"pr": s.store.GetPR(r.PathValue("id"))})
+		return
+	}
+	p := s.store.FindPost(r.PathValue("id"))
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleSubmitReview(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Status string `json:"status"`
+		Note   string `json:"note"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	kind := "post"
+	if strings.Contains(r.URL.Path, "/api/prs/") {
+		kind = "pr"
+	}
+	if err := s.store.SubmitReview(kind, r.PathValue("id"), in.Status, in.Note, u); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if kind == "pr" {
+		writeJSON(w, 200, map[string]any{"pr": s.store.GetPR(r.PathValue("id"))})
+		return
+	}
+	p := s.store.FindPost(r.PathValue("id"))
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleResolvePR(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Body string `json:"body"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	pr, err := s.store.ResolvePR(r.PathValue("id"), in.Body, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"pr": pr})
 }
 
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {

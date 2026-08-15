@@ -1675,6 +1675,53 @@ html.wysimark-on {
   margin: 12px 0;
 }
 
+.protect-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.check-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 8px 0 16px;
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+}
+
+.check-row input {
+  margin-top: 4px;
+}
+
+.trailers {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.trailers code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-subtle);
+}
+
+.conflict-box,
+.review-box {
+  margin: 24px 0;
+}
+
+.conflict-edit {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  min-height: 240px;
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+}
+
 .para-edit {
   width: 100%;
   background: var(--bg-elevated);

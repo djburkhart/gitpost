@@ -51,6 +51,67 @@ function normalizeTopicName(s: string): string {
   return s;
 }
 
+function parseReviews(raw: string | null | undefined): any[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+function canPushPost(p: any, viewer: User | null): boolean {
+  if (!p || !viewer) return false;
+  if (p.owner === viewer.handle) return true;
+  if (parseTopics(p.maintainers_json).includes(viewer.handle)) return true;
+  if (!p.protected && parseTopics(p.coauthors_json).includes(viewer.handle)) return true;
+  return false;
+}
+
+function reviewsReady(list: any[]): boolean {
+  if (!list.length) return true;
+  return list.every((r) => r.status === "approved");
+}
+
+function trailerBlock(p: any, user: User, signoff: boolean): string {
+  const lines: string[] = [];
+  for (const h of parseTopics(p.coauthors_json)) {
+    if (h.toLowerCase() === user.handle.toLowerCase()) continue;
+    lines.push(`Co-authored-by: ${h} <${h}@gitpo.st>`);
+  }
+  if (signoff) lines.push(`Signed-off-by: ${user.name} <${user.email}>`);
+  return lines.join("\n");
+}
+
+function ideaMergeText(base: string, ours: string, theirs: string, oursLabel: string, theirsLabel: string): { body: string; conflict: boolean } {
+  if (ours === theirs) return { body: theirs, conflict: false };
+  if (ours === base) return { body: theirs, conflict: false };
+  if (theirs === base) return { body: ours, conflict: false };
+  const b = splitParagraphs(base);
+  const o = splitParagraphs(ours);
+  const t = splitParagraphs(theirs);
+  const n = Math.max(o.length, t.length, b.length);
+  const out: string[] = [];
+  let conflict = false;
+  for (let i = 0; i < n; i++) {
+    const bp = b[i] || "";
+    const op = o[i] || "";
+    const tp = t[i] || "";
+    if (op === tp) {
+      if (op) out.push(op);
+    } else if (op === bp) {
+      if (tp) out.push(tp);
+    } else if (tp === bp) {
+      if (op) out.push(op);
+    } else {
+      conflict = true;
+      out.push(`<<<<<<< ${oursLabel}\n${op}\n=======\n${tp}\n>>>>>>> ${theirsLabel}`);
+    }
+  }
+  return { body: out.join("\n\n"), conflict };
+}
+
 function parseTopics(raw: string | null | undefined): string[] {
   if (!raw) return [];
   try {
@@ -347,6 +408,15 @@ export class GitPostStore extends DurableObject<Env> {
       "ALTER TABLE prs ADD COLUMN review_note TEXT",
       "ALTER TABLE prs ADD COLUMN comments_json TEXT",
       "ALTER TABLE posts ADD COLUMN topics_json TEXT",
+      "ALTER TABLE posts ADD COLUMN coauthors_json TEXT",
+      "ALTER TABLE posts ADD COLUMN invites_json TEXT",
+      "ALTER TABLE posts ADD COLUMN maintainers_json TEXT",
+      "ALTER TABLE posts ADD COLUMN protected INTEGER",
+      "ALTER TABLE posts ADD COLUMN reviewers_json TEXT",
+      "ALTER TABLE prs ADD COLUMN draft INTEGER",
+      "ALTER TABLE prs ADD COLUMN reviewers_json TEXT",
+      "ALTER TABLE prs ADD COLUMN conflict_body TEXT",
+      "ALTER TABLE commits ADD COLUMN trailers TEXT",
     ]) {
       try {
         this.ctx.storage.sql.exec(extra);
@@ -505,6 +575,13 @@ export class GitPostStore extends DurableObject<Env> {
       commitCount,
       forkCount,
       topics: parseTopics(p.topics_json),
+      coAuthors: parseTopics(p.coauthors_json),
+      coAuthorInvites: parseTopics(p.invites_json),
+      maintainers: parseTopics(p.maintainers_json),
+      protected: !!p.protected,
+      reviewers: parseReviews(p.reviewers_json),
+      canPush: canPushPost(p, viewer),
+      invited: !!(viewer && parseTopics(p.invites_json).includes(viewer.handle)),
     };
   }
 
@@ -575,10 +652,12 @@ export class GitPostStore extends DurableObject<Env> {
     return this.findPost(id)!;
   }
 
-  private async amendPost(id: string, user: User, subject: string, body: string, story: unknown, topics?: string[]) {
+  private async amendPost(id: string, user: User, subject: string, body: string, story: unknown, topics?: string[], signoff = true) {
     const p = this.findPost(id);
     if (!p) throw new Error("not found");
-    if (p.owner !== user.handle) throw new Error("forbidden");
+    if (!canPushPost(p, user)) {
+      throw new Error(p.protected ? "main is protected — open a pull request" : "forbidden");
+    }
     const ts = new Date().toISOString();
     const sha = await this.commit(p.id, user, subject.trim() || p.subject, body, story, ts, p.head_sha, p.default_branch || "main");
     const topicList = extractTopics(topics || parseTopics(p.topics_json), subject.trim() || p.subject, body);
@@ -1220,7 +1299,7 @@ export class GitPostStore extends DurableObject<Env> {
           const inb = await req.json<any>();
           let story = p.story_json ? JSON.parse(p.story_json) : null;
           if (inb.storyUrl && inb.storyUrl !== p.story_url) story = await fetchStory(inb.storyUrl);
-          const np = await this.amendPost(p.id, viewer, inb.subject, inb.body, story, inb.topics);
+          const np = await this.amendPost(p.id, viewer, inb.subject, inb.body, story, inb.topics, inb.signoff !== false);
           return json({ post: this.postPayload(np, viewer) });
         }
 
@@ -1292,6 +1371,91 @@ export class GitPostStore extends DurableObject<Env> {
             return item;
           });
           return json({ forks: takes, takes });
+        }
+
+        if (rest === "coauthors" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          if (!canPushPost(p, viewer)) return err(403, "forbidden");
+          const inb = await req.json<any>();
+          const u = this.one<User>("SELECT * FROM users WHERE lower(handle) = ?", String(inb.handle || "").toLowerCase());
+          if (!u) return err(404, "not found");
+          const invites = parseTopics(p.invites_json);
+          const authors = parseTopics(p.coauthors_json);
+          if (u.handle !== p.owner && !authors.includes(u.handle) && !invites.includes(u.handle)) invites.push(u.handle);
+          this.sql("UPDATE posts SET invites_json = ? WHERE id = ?", JSON.stringify(invites), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+
+        if (rest === "coauthors/accept" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const invites = parseTopics(p.invites_json).filter((h) => h !== viewer.handle);
+          const authors = parseTopics(p.coauthors_json);
+          if (!parseTopics(p.invites_json).includes(viewer.handle)) return err(403, "forbidden");
+          if (!authors.includes(viewer.handle)) authors.push(viewer.handle);
+          this.sql("UPDATE posts SET invites_json = ?, coauthors_json = ? WHERE id = ?", JSON.stringify(invites), JSON.stringify(authors), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+
+        const rmCo = rest.match(/^coauthors\/([^/]+)$/);
+        if (rmCo && method === "DELETE") {
+          if (!viewer) return err(401, "unauthorized");
+          const handle = decodeURIComponent(rmCo[1]);
+          if (viewer.handle !== p.owner && viewer.handle !== handle) return err(403, "forbidden");
+          const authors = parseTopics(p.coauthors_json).filter((h) => h !== handle);
+          const invites = parseTopics(p.invites_json).filter((h) => h !== handle);
+          const mains = parseTopics(p.maintainers_json).filter((h) => h !== handle);
+          this.sql("UPDATE posts SET coauthors_json = ?, invites_json = ?, maintainers_json = ? WHERE id = ?", JSON.stringify(authors), JSON.stringify(invites), JSON.stringify(mains), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+
+        if (rest === "protect" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          if (p.owner !== viewer.handle) return err(403, "forbidden");
+          const inb = await req.json<any>();
+          const mains: string[] = [];
+          for (const h of inb.maintainers || []) {
+            const u = this.one<User>("SELECT * FROM users WHERE lower(handle) = ?", String(h).toLowerCase());
+            if (u && u.handle !== p.owner) mains.push(u.handle);
+          }
+          const authors = parseTopics(p.coauthors_json);
+          for (const h of mains) if (!authors.includes(h)) authors.push(h);
+          this.sql(
+            "UPDATE posts SET protected = ?, maintainers_json = ?, coauthors_json = ? WHERE id = ?",
+            inb.protected ? 1 : 0,
+            JSON.stringify(mains),
+            JSON.stringify(authors),
+            p.id,
+          );
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+
+        if (rest === "reviewers" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          if (p.owner !== viewer.handle && !canPushPost(p, viewer)) return err(403, "forbidden");
+          const inb = await req.json<any>();
+          const u = this.one<User>("SELECT * FROM users WHERE lower(handle) = ?", String(inb.handle || "").toLowerCase());
+          if (!u) return err(404, "not found");
+          const list = parseReviews(p.reviewers_json);
+          if (!list.some((r) => r.handle === u.handle)) {
+            list.push({ handle: u.handle, status: "requested", requestedBy: viewer.handle, updatedAt: new Date().toISOString() });
+          }
+          this.sql("UPDATE posts SET reviewers_json = ? WHERE id = ?", JSON.stringify(list), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+
+        if (rest === "review" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const inb = await req.json<any>();
+          const status = String(inb.status || "").toLowerCase();
+          if (status !== "approved" && status !== "changes") return err(400, "bad request");
+          const list = parseReviews(p.reviewers_json);
+          const mine = list.find((r) => r.handle === viewer.handle);
+          if (!mine) return err(403, "forbidden");
+          mine.status = status;
+          mine.note = inb.note || "";
+          mine.updatedAt = new Date().toISOString();
+          this.sql("UPDATE posts SET reviewers_json = ? WHERE id = ?", JSON.stringify(list), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
         }
 
         if (rest === "excerpt" && method === "POST") {
@@ -1538,22 +1702,36 @@ export class GitPostStore extends DurableObject<Env> {
             const newT = src ? encodePostFile(src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null) : "";
             diff = unifiedDiff(oldT, newT);
           }
-          return json({ pr: mapPR(pr), diff, source: src, target: dst });
+          return json({
+            pr: mapPR(pr),
+            diff,
+            source: src ? this.postPayload(src, viewer) : null,
+            target: dst ? this.postPayload(dst, viewer) : null,
+          });
         }
 
         if (rest === "merge" && method === "POST") {
           if (!viewer) return err(401, "unauthorized");
           const dst = this.findPost(pr.target_post_id);
           if (!dst) return err(404, "not found");
-          if (dst.owner !== viewer.handle) return err(403, "forbidden");
-          if (pr.status !== "open") return err(409, "conflict");
+          if (!canPushPost(dst, viewer)) {
+            return err(403, dst.protected ? "main is protected — open a pull request" : "forbidden");
+          }
+          if (pr.status !== "open" && pr.status !== "conflict") return err(409, "conflict");
+          const reviewers = parseReviews(pr.reviewers_json);
+          if (pr.draft && !reviewsReady(reviewers)) return err(409, "this is still a draft — mark it ready after reviews");
+          if (!reviewsReady(reviewers)) return err(409, "requested reviews are still pending");
           if (pr.kind === "paragraph") {
             let next: string;
             try {
               next = applyParagraph(dst.body || "", Number(pr.paragraph_index) || 0, pr.original || "", pr.proposed || "");
             } catch (e: any) {
               const msg = String(e?.message || e);
-              if (msg.includes("changed")) return err(409, msg);
+              if (msg.includes("changed")) {
+                const block = `<<<<<<< yours (@${dst.owner} — current main)\n${pr.original || ""}\n=======\n${pr.proposed || ""}\n>>>>>>> incoming from @${pr.author}`;
+                this.sql("UPDATE prs SET status = 'conflict', conflict_body = ?, updated_at = ? WHERE id = ?", block, new Date().toISOString(), pr.id);
+                return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+              }
               return err(400, msg);
             }
             const sha = await this.commit(
@@ -1565,15 +1743,75 @@ export class GitPostStore extends DurableObject<Env> {
               new Date().toISOString(),
               dst.head_sha,
             );
-            this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+            this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, conflict_body = '', updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
             this.recordEvent("merge", dst.id, sha, viewer.handle);
             return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
           }
           const src = this.findPost(pr.source_post_id);
           if (!src) return err(404, "not found");
-          const sha = await this.commit(dst.id, viewer, `Merge PR #${pr.number}: ${pr.title}`, src.body, src.story_json ? JSON.parse(src.story_json) : null, new Date().toISOString(), dst.head_sha);
-          this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+          let baseBody = dst.body || "";
+          if (src.forked_from_sha) {
+            const c = this.one<any>("SELECT * FROM commits WHERE sha = ?", src.forked_from_sha);
+            if (c) baseBody = c.body || "";
+          } else if (pr.target_sha) {
+            const c = this.one<any>("SELECT * FROM commits WHERE sha = ?", pr.target_sha);
+            if (c) baseBody = c.body || "";
+          }
+          const merged = ideaMergeText(baseBody, dst.body || "", src.body || "", `yours (@${dst.owner} — current main)`, `incoming from @${pr.author} (PR #${pr.number})`);
+          if (merged.conflict) {
+            this.sql("UPDATE prs SET status = 'conflict', conflict_body = ?, updated_at = ? WHERE id = ?", merged.body, new Date().toISOString(), pr.id);
+            return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+          }
+          const sha = await this.commit(dst.id, viewer, `Merge PR #${pr.number}: ${pr.title}`, merged.body, src.story_json ? JSON.parse(src.story_json) : null, new Date().toISOString(), dst.head_sha);
+          this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, conflict_body = '', updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
           this.recordEvent("merge", dst.id, sha, viewer.handle);
+          return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+        }
+
+        if (rest === "resolve" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const dst = this.findPost(pr.target_post_id);
+          if (!dst) return err(404, "not found");
+          if (!canPushPost(dst, viewer)) return err(403, "forbidden");
+          if (pr.status !== "conflict") return err(409, "conflict");
+          const inb = await req.json<any>();
+          const body = String(inb.body || "").trim();
+          if (!body || body.includes("<<<<<<<") || body.includes(">>>>>>>")) {
+            return err(400, "resolve the conflict markers before merging");
+          }
+          if (!reviewsReady(parseReviews(pr.reviewers_json))) return err(409, "requested reviews are still pending");
+          const sha = await this.commit(dst.id, viewer, `Resolve idea conflict from PR #${pr.number}`, body, dst.story_json ? JSON.parse(dst.story_json) : null, new Date().toISOString(), dst.head_sha);
+          this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, conflict_body = '', draft = 0, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+          this.recordEvent("merge", dst.id, sha, viewer.handle);
+          return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+        }
+
+        if (rest === "reviewers" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const inb = await req.json<any>();
+          const u = this.one<User>("SELECT * FROM users WHERE lower(handle) = ?", String(inb.handle || "").toLowerCase());
+          if (!u) return err(404, "not found");
+          const list = parseReviews(pr.reviewers_json);
+          if (!list.some((r) => r.handle === u.handle)) {
+            list.push({ handle: u.handle, status: "requested", requestedBy: viewer.handle, updatedAt: new Date().toISOString() });
+          }
+          this.sql("UPDATE prs SET reviewers_json = ?, draft = 1, updated_at = ? WHERE id = ?", JSON.stringify(list), new Date().toISOString(), pr.id);
+          return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+        }
+
+        if (rest === "review" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const inb = await req.json<any>();
+          const status = String(inb.status || "").toLowerCase();
+          if (status !== "approved" && status !== "changes") return err(400, "bad request");
+          const list = parseReviews(pr.reviewers_json);
+          const mine = list.find((r) => r.handle === viewer.handle);
+          if (!mine) return err(403, "forbidden");
+          mine.status = status;
+          mine.note = inb.note || "";
+          mine.updatedAt = new Date().toISOString();
+          const draft = reviewsReady(list) ? 0 : 1;
+          this.sql("UPDATE prs SET reviewers_json = ?, draft = ?, updated_at = ? WHERE id = ?", JSON.stringify(list), draft, new Date().toISOString(), pr.id);
           return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
         }
 
@@ -1646,7 +1884,8 @@ export class GitPostStore extends DurableObject<Env> {
       const msg = String(e?.message || e);
       if (msg === "not found") return err(404, msg);
       if (msg === "unauthorized") return err(401, msg);
-      if (msg === "forbidden") return err(403, msg);
+      if (msg.includes("protected")) return err(403, msg);
+      if (msg.includes("reviews") || msg.includes("draft")) return err(409, msg);
       if (msg === "that paragraph has changed since this proposal") return err(409, msg);
       if (msg === "bad request") return err(400, msg);
       return err(500, msg);
@@ -1680,6 +1919,9 @@ function mapPR(pr: any) {
     rationale: pr.rationale || "",
     reviewNote: pr.review_note || "",
     comments,
+    reviewers: parseReviews(pr.reviewers_json),
+    draft: !!pr.draft,
+    conflictBody: pr.conflict_body || "",
     createdAt: pr.created_at,
     updatedAt: pr.updated_at,
   };

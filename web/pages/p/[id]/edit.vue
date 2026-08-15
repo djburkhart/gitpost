@@ -15,6 +15,13 @@
         <WysimarkEditor ref="editor" v-model="body" placeholder="Amend the body. Markdown is welcome." />
       </div>
       <TopicField v-model="topics" label="Remotes" placeholder="ai-safety, writing…" />
+      <label class="check-row">
+        <input v-model="signoff" type="checkbox" />
+        <span>Signed-off-by {{ user?.name }} <{{ user?.email }}></span>
+      </label>
+      <p v-if="(post.coAuthors || []).length" class="subtle" style="margin-top: 0">
+        Also attaching Co-authored-by for {{ post.coAuthors.join(", ") }}.
+      </p>
       <div class="row">
         <button class="btn btn-primary" type="submit" :disabled="busy">Commit amendment</button>
         <NuxtLink :to="`/p/${post.id}`" class="btn btn-ghost">Back</NuxtLink>
@@ -31,6 +38,7 @@ const post = ref<any>(null);
 const subject = ref("");
 const body = ref("");
 const topics = ref<string[]>([]);
+const signoff = ref(true);
 const busy = ref(false);
 const editor = ref<{ getMarkdown: () => string } | null>(null);
 
@@ -41,7 +49,7 @@ onMounted(async () => {
   subject.value = data.post.subject;
   body.value = data.post.body;
   topics.value = data.post.topics || [];
-  if (!user.value || user.value.handle !== data.post.owner) {
+  if (!user.value || !data.post.canPush) {
     await navigateTo(`/p/${data.post.id}`);
   }
 });
@@ -52,7 +60,7 @@ async function submit() {
     const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}`, {
       method: "PUT",
-      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: post.value.storyUrl, topics: topics.value }),
+      body: JSON.stringify({ subject: subject.value, body: markdown, storyUrl: post.value.storyUrl, topics: topics.value, signoff: signoff.value }),
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {

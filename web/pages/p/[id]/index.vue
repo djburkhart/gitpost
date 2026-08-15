@@ -22,6 +22,11 @@
         <span>{{ post.starCount }} {{ post.starCount === 1 ? "star" : "stars" }}</span>
         <span>{{ post.forkCount }} {{ post.forkCount === 1 ? "fork" : "forks" }}</span>
       </div>
+      <div v-if="post.coAuthors?.length || post.protected" class="topic-row">
+        <span class="subtle">Co-authored-by</span>
+        <NuxtLink v-for="h in post.coAuthors || []" :key="h" :to="`/u/${h}`" class="pill">@{{ h }}</NuxtLink>
+        <span v-if="post.protected" class="pill">protected</span>
+      </div>
       <div v-if="post.topics?.length" class="topic-row">
         <NuxtLink v-for="t in post.topics" :key="t" :to="`/explore?q=remote:${t}`" class="pill">remote:{{ t }}</NuxtLink>
         <button v-if="user && !followingAll" class="btn btn-ghost btn-sm" type="button" @click="followTopics">Track remotes</button>
@@ -36,12 +41,12 @@
         Watch
       </button>
       <button class="btn btn-sm" @click="startFork">Fork</button>
-      <NuxtLink v-if="mine" :to="`/p/${post.id}/edit`" class="btn btn-sm">Amend</NuxtLink>
+      <NuxtLink v-if="post.canPush" :to="`/p/${post.id}/edit`" class="btn btn-sm">Amend</NuxtLink>
       <button v-if="canPR" class="btn btn-sm" @click="openPR">Open pull request</button>
       <button v-if="canPropose" class="btn btn-sm" :class="{ 'btn-primary': proposeMode }" type="button" @click="togglePropose">
         {{ proposeMode ? "Done proposing" : "Propose a change" }}
       </button>
-      <button v-if="mine && cherrySha" class="btn btn-sm" @click="doCherry">Cherry-pick {{ cherrySha.slice(0, 7) }}</button>
+      <button v-if="post.canPush && cherrySha" class="btn btn-sm" @click="doCherry">Cherry-pick {{ cherrySha.slice(0, 7) }}</button>
       <button v-if="user?.isAdmin" class="btn btn-sm btn-danger" type="button" @click="adminDelete">Remove post</button>
     </div>
 
@@ -80,7 +85,10 @@
             <span>{{ c.author }}</span>
             <time>{{ formatAgo(c.date) }}</time>
             <button class="btn btn-ghost btn-sm" type="button" @click="selectCommit(c.sha)">view blob</button>
-            <button v-if="mine" class="btn btn-ghost btn-sm" type="button" @click="cherrySha = c.sha">mark cherry-pick</button>
+            <button v-if="post.canPush" class="btn btn-ghost btn-sm" type="button" @click="cherrySha = c.sha">mark cherry-pick</button>
+          </div>
+          <div v-if="c.trailers?.length" class="trailers">
+            <code v-for="t in c.trailers" :key="t">{{ t }}</code>
           </div>
         </div>
         <span class="sha">{{ c.shortSha }}</span>
@@ -132,6 +140,10 @@
       <DiscussThread :post-id="post.id" :mine="!!mine" />
     </section>
 
+    <section v-else-if="tab === 'collab'">
+      <Collaborators :post="post" @updated="post = $event" />
+    </section>
+
     <section v-else-if="tab === 'takes'">
       <p class="muted" style="margin-top: 0">Other branches of this idea. Each fork carries an intent.</p>
       <ul class="log-list">
@@ -151,7 +163,7 @@
     </section>
 
     <section v-else-if="tab === 'branches'">
-      <form v-if="mine" class="row" style="margin-bottom: 16px" @submit.prevent="createBranch">
+      <form v-if="post.canPush" class="row" style="margin-bottom: 16px" @submit.prevent="createBranch">
         <input v-model="newBranch" placeholder="alternative-take" class="btn" style="flex: 1; text-align: left" />
         <button class="btn btn-primary" type="submit">Branch</button>
       </form>
@@ -162,7 +174,7 @@
             <strong>{{ b.name }}</strong>
             <div class="sha">{{ b.sha.slice(0, 7) }}</div>
           </div>
-          <button v-if="mine && !b.head" class="btn btn-sm" type="button" @click="checkout(b.name)">check out</button>
+          <button v-if="post.canPush && !b.head" class="btn btn-sm" type="button" @click="checkout(b.name)">check out</button>
         </li>
       </ul>
     </section>
@@ -222,6 +234,7 @@ const tabs = [
   { id: "diff", label: "Diff" },
   { id: "diverge", label: "Diverge" },
   { id: "discuss", label: "Discuss" },
+  { id: "collab", label: "Collab" },
   { id: "takes", label: "Takes" },
   { id: "branches", label: "Branches" },
   { id: "pulls", label: "Pulls" },
