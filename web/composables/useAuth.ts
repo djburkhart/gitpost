@@ -4,6 +4,10 @@ export type User = {
   name: string;
   email: string;
   bio: string;
+  role?: string;
+  disabled?: boolean;
+  isAdmin?: boolean;
+  isSuperAdmin?: boolean;
 };
 
 export const useAuth = () => {
@@ -30,7 +34,13 @@ export const useAuth = () => {
     return data.user;
   }
 
-  async function register(payload: { handle: string; name: string; password: string; bio?: string }) {
+  async function register(payload: {
+    handle: string;
+    name: string;
+    password: string;
+    bio?: string;
+    invite?: string;
+  }) {
     const data = await api<{ user: User }>("/api/auth/register", {
       method: "POST",
       body: JSON.stringify(payload),

@@ -26,25 +26,18 @@ var (
 )
 
 type User struct {
-	ID           string    `json:"id"`
-	Handle       string    `json:"handle"`
-	Name         string    `json:"name"`
-	Email        string    `json:"email"`
-	Bio          string    `json:"bio"`
-	PasswordHash string    `json:"-"`
-	PassStored   string    `json:"passwordHash"`
-	CreatedAt    time.Time `json:"createdAt"`
-}
-
-func (u User) Public() map[string]any {
-	return map[string]any{
-		"id":        u.ID,
-		"handle":    u.Handle,
-		"name":      u.Name,
-		"email":     u.Email,
-		"bio":       u.Bio,
-		"createdAt": u.CreatedAt,
-	}
+	ID           string     `json:"id"`
+	Handle       string     `json:"handle"`
+	Name         string     `json:"name"`
+	Email        string     `json:"email"`
+	Bio          string     `json:"bio"`
+	PasswordHash string     `json:"-"`
+	PassStored   string     `json:"passwordHash"`
+	Role         string     `json:"role"`
+	Disabled     bool       `json:"disabled"`
+	FailedLogins int        `json:"failedLogins"`
+	LockedUntil  *time.Time `json:"lockedUntil,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
 }
 
 type Post struct {
@@ -119,6 +112,9 @@ type BranchInfo struct {
 type Session struct {
 	Token     string    `json:"token"`
 	UserID    string    `json:"userId"`
+	UserAgent string    `json:"userAgent,omitempty"`
+	IP        string    `json:"ip,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 
@@ -127,6 +123,9 @@ type persisted struct {
 	Posts    []Post        `json:"posts"`
 	PRs      []PullRequest `json:"prs"`
 	Sessions []Session     `json:"sessions"`
+	Invites  []Invite      `json:"invites"`
+	Audits   []AuditEvent  `json:"audits"`
+	Settings Settings      `json:"settings"`
 	PRSeq    int           `json:"prSeq"`
 }
 
@@ -139,6 +138,9 @@ type Store struct {
 	posts    map[string]*Post
 	prs      map[string]*PullRequest
 	sessions map[string]*Session
+	invites  map[string]*Invite
+	audits   []AuditEvent
+	settings Settings
 	prSeq    int
 }
 
@@ -148,12 +150,14 @@ func NewStore(root string) (*Store, error) {
 	}
 	s := &Store{
 		root:     root,
-		secret:   []byte("gitpost-demo-secret-change-me"),
+		secret:   []byte(idHex(24)),
 		users:    map[string]*User{},
 		byHandle: map[string]*User{},
 		posts:    map[string]*Post{},
 		prs:      map[string]*PullRequest{},
 		sessions: map[string]*Session{},
+		invites:  map[string]*Invite{},
+		settings: Settings{SignupMode: SignupInvite, MinPassword: 12},
 	}
 	_ = s.load()
 	return s, nil
@@ -195,6 +199,19 @@ func (s *Store) load() error {
 		}
 	}
 	s.prSeq = p.PRSeq
+	s.settings = p.Settings
+	if s.settings.SignupMode == "" {
+		s.settings.SignupMode = SignupInvite
+	}
+	if s.settings.MinPassword < 12 {
+		s.settings.MinPassword = 12
+	}
+	s.audits = p.Audits
+	s.invites = map[string]*Invite{}
+	for i := range p.Invites {
+		cp := p.Invites[i]
+		s.invites[cp.Code] = &cp
+	}
 	return nil
 }
 
@@ -214,6 +231,11 @@ func (s *Store) save() error {
 	for _, sess := range s.sessions {
 		p.Sessions = append(p.Sessions, *sess)
 	}
+	for _, inv := range s.invites {
+		p.Invites = append(p.Invites, *inv)
+	}
+	p.Audits = s.audits
+	p.Settings = s.settings
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -229,11 +251,6 @@ func idHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func hashPass(pw string) string {
-	sum := sha256.Sum256([]byte("gitpost:" + pw))
-	return hex.EncodeToString(sum[:])
 }
 
 func slugify(s string) string {
@@ -439,6 +456,7 @@ func (s *Store) CreateUser(handle, name, email, bio, password string) (*User, er
 		Email:        email,
 		Bio:          bio,
 		PasswordHash: hashPass(password),
+		Role:         RoleMember,
 		CreatedAt:    time.Now().UTC(),
 	}
 	s.users[u.ID] = u
@@ -446,27 +464,87 @@ func (s *Store) CreateUser(handle, name, email, bio, password string) (*User, er
 	return u, s.save()
 }
 
+func (s *Store) RegisterUser(handle, name, email, bio, password, invite string) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	handle = strings.ToLower(strings.TrimSpace(handle))
+	if handle == "" || password == "" {
+		return nil, errBadRequest
+	}
+	if err := s.consumeInvite(invite, handle); err != nil {
+		return nil, err
+	}
+	if s.byHandle[handle] != nil {
+		return nil, errConflict
+	}
+	if email == "" {
+		email = handle + "@gitpo.st"
+	}
+	if name == "" {
+		name = handle
+	}
+	u := &User{
+		ID:           idHex(8),
+		Handle:       handle,
+		Name:         name,
+		Email:        email,
+		Bio:          bio,
+		PasswordHash: hashPass(password),
+		Role:         RoleMember,
+		CreatedAt:    time.Now().UTC(),
+	}
+	s.users[u.ID] = u
+	s.byHandle[handle] = u
+	s.auditUnlocked("system", "user.register", handle, "")
+	return u, s.save()
+}
+
 func (s *Store) Authenticate(handle, password string) (*User, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	u := s.byHandle[strings.ToLower(strings.TrimSpace(handle))]
-	if u == nil || u.PasswordHash != hashPass(password) {
+	if u == nil {
 		return nil, errUnauthorized
 	}
+	if u.Disabled {
+		return nil, errDisabled
+	}
+	if u.LockedUntil != nil && u.LockedUntil.After(nowUTC()) {
+		return nil, errLocked
+	}
+	if !checkPass(u.PasswordHash, password) {
+		u.FailedLogins++
+		if u.FailedLogins >= lockAfter {
+			t := nowUTC().Add(lockFor)
+			u.LockedUntil = &t
+		}
+		_ = s.save()
+		if u.LockedUntil != nil && u.LockedUntil.After(nowUTC()) {
+			return nil, errLocked
+		}
+		return nil, errUnauthorized
+	}
+	u.FailedLogins = 0
+	u.LockedUntil = nil
+	_ = s.save()
 	return u, nil
 }
 
-func (s *Store) CreateSession(userID string) (string, error) {
+func (s *Store) CreateSession(userID, ua, ip string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tok := idHex(24)
 	mac := hmac.New(sha256.New, s.secret)
 	mac.Write([]byte(tok))
 	signed := tok + "." + hex.EncodeToString(mac.Sum(nil))[:16]
+	now := nowUTC()
 	s.sessions[signed] = &Session{
 		Token:     signed,
 		UserID:    userID,
-		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
+		UserAgent: ua,
+		IP:        ip,
+		CreatedAt: now,
+		ExpiresAt: now.Add(30 * 24 * time.Hour),
 	}
 	return signed, s.save()
 }

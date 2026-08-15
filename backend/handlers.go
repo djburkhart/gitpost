@@ -27,6 +27,20 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 409, map[string]string{"error": "conflict"})
 	case errors.Is(err, errBadRequest):
 		writeJSON(w, 400, map[string]string{"error": "bad request"})
+	case errors.Is(err, errLocked):
+		writeJSON(w, 429, map[string]string{"error": "account temporarily locked"})
+	case errors.Is(err, errDisabled):
+		writeJSON(w, 403, map[string]string{"error": "account disabled"})
+	case errors.Is(err, errWeakPassword):
+		writeJSON(w, 400, map[string]string{"error": "password must be at least 12 characters and include a letter and a number"})
+	case errors.Is(err, errInviteReq):
+		writeJSON(w, 400, map[string]string{"error": "an invite code is required"})
+	case errors.Is(err, errInviteBad):
+		writeJSON(w, 400, map[string]string{"error": "invite code is invalid or expired"})
+	case errors.Is(err, errSignupClosed):
+		writeJSON(w, 403, map[string]string{"error": "registration is closed"})
+	case errors.Is(err, errLastSuper):
+		writeJSON(w, 403, map[string]string{"error": "cannot modify the super admin"})
 	default:
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 	}
@@ -43,7 +57,11 @@ func (s *Server) currentUser(r *http.Request) *User {
 	if err != nil || c.Value == "" {
 		return nil
 	}
-	return s.store.UserBySession(c.Value)
+	u := s.store.UserBySession(c.Value)
+	if u != nil && u.Disabled {
+		return nil
+	}
+	return u
 }
 
 func (s *Server) requireUser(w http.ResponseWriter, r *http.Request) *User {
@@ -82,17 +100,22 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Email    string `json:"email"`
 		Bio      string `json:"bio"`
 		Password string `json:"password"`
+		Invite   string `json:"invite"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, errBadRequest)
 		return
 	}
-	u, err := s.store.CreateUser(in.Handle, in.Name, in.Email, in.Bio, in.Password)
+	if err := validatePassword(in.Password, s.store.Settings().MinPassword); err != nil {
+		writeErr(w, err)
+		return
+	}
+	u, err := s.store.RegisterUser(in.Handle, in.Name, in.Email, in.Bio, in.Password, in.Invite)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	tok, err := s.store.CreateSession(u.ID)
+	tok, err := s.store.CreateSession(u.ID, r.UserAgent(), clientIP(r))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -115,7 +138,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	tok, err := s.store.CreateSession(u.ID)
+	tok, err := s.store.CreateSession(u.ID, r.UserAgent(), clientIP(r))
 	if err != nil {
 		writeErr(w, err)
 		return

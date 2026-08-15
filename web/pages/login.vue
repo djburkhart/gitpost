@@ -17,15 +17,8 @@
       </form>
       <p class="muted" style="margin: 16px 0 0; font-size: 0.9rem">
         No account?
-        <NuxtLink to="/join">Create one</NuxtLink>
+        <NuxtLink to="/join">Request access</NuxtLink>
       </p>
-      <p class="kicker" style="margin-top: 24px">Demo identities</p>
-      <div class="demo-accounts">
-        <button v-for="d in demos" :key="d.handle" class="btn" type="button" @click="quick(d.handle)">
-          <span>{{ d.name }}</span>
-          <span class="sha">@{{ d.handle }}</span>
-        </button>
-      </div>
     </div>
   </main>
 </template>
@@ -33,15 +26,9 @@
 <script setup lang="ts">
 const { login } = useAuth();
 const handle = ref("");
-const password = ref("demo");
+const password = ref("");
 const error = ref("");
 const route = useRoute();
-const demos = [
-  { handle: "ada", name: "Ada Lovelace" },
-  { handle: "linus", name: "Linus T." },
-  { handle: "maya", name: "Maya Chen" },
-  { handle: "guest", name: "Guest" },
-];
 
 async function submit() {
   error.value = "";
@@ -51,11 +38,5 @@ async function submit() {
   } catch (e: any) {
     error.value = e.message || "Could not sign in";
   }
-}
-
-async function quick(h: string) {
-  handle.value = h;
-  password.value = "demo";
-  await submit();
 }
 </script>

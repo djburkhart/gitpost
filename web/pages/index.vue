@@ -25,8 +25,8 @@
           <li>Open a PR to improve someone else’s paragraph</li>
           <li>Cherry-pick a single idea into your tree</li>
         </ul>
-        <p class="subtle" style="margin: 16px 0 0; font-size: 0.8rem; font-family: var(--font-mono)">
-          Demo accounts: ada / linus / maya / guest — password <em>demo</em>
+        <p class="subtle" style="margin: 16px 0 0; font-size: 0.8rem">
+          New identities are invite-only. Super admin: @danny.
         </p>
       </aside>
     </div>

@@ -1,10 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { unifiedDiff } from "./diff";
-import { DEMO_USERS, SEED_POSTS } from "./seed";
+import { ADMIN_BIO, ADMIN_EMAIL, ADMIN_HANDLE, ADMIN_NAME, SEED_VERSION } from "./seed";
 
 export interface Env {
   STORE: DurableObjectNamespace<GitPostStore>;
   ASSETS: Fetcher;
+  ADMIN_PASSWORD?: string;
 }
 
 type User = {
@@ -15,6 +16,10 @@ type User = {
   bio: string;
   password_hash: string;
   created_at: string;
+  role?: string;
+  disabled?: number;
+  failed_logins?: number;
+  locked_until?: string;
 };
 
 function json(data: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -54,7 +59,47 @@ async function shaHex(algo: "SHA-1" | "SHA-256", text: string): Promise<string> 
 }
 
 async function hashPass(pw: string): Promise<string> {
-  return shaHex("SHA-256", "gitpost:" + pw);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, base, 256);
+  return `pbkdf2$100000$${hexBytes(salt)}$${hexBytes(new Uint8Array(bits))}`;
+}
+
+async function checkPass(stored: string, pw: string): Promise<boolean> {
+  if (!stored) return false;
+  if (stored.startsWith("pbkdf2$")) {
+    const [, iterS, saltHex, hashHex] = stored.split("$");
+    const iter = Number(iterS) || 120000;
+    const salt = unhex(saltHex);
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: iter, hash: "SHA-256" }, base, 256);
+    return hexBytes(new Uint8Array(bits)) === hashHex;
+  }
+  return (await shaHex("SHA-256", "gitpost:" + pw)) === stored;
+}
+
+function hexBytes(b: Uint8Array): string {
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function unhex(s: string): Uint8Array {
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function validatePassword(pw: string, min = 12): string | null {
+  if (pw.length < min) return "password must be at least 12 characters and include a letter and a number";
+  if (!/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw)) return "password must be at least 12 characters and include a letter and a number";
+  return null;
+}
+
+function isAdmin(u: User | null): boolean {
+  return !!u && (u.role === "admin" || u.role === "superadmin");
+}
+
+function isSuper(u: User | null): boolean {
+  return !!u && u.role === "superadmin";
 }
 
 async function gitCommitSha(payload: string): Promise<string> {
@@ -104,6 +149,21 @@ export class GitPostStore extends DurableObject<Env> {
   }
 
   private async init() {
+    let ver: { value: string } | null = null;
+    try {
+      ver = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "seed_version");
+    } catch {
+      ver = null;
+    }
+    if (!ver || ver.value !== SEED_VERSION) {
+      for (const t of ["stars", "watches", "branches", "commits", "prs", "posts", "sessions", "users", "invites", "audits", "settings", "meta"]) {
+        try {
+          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${t}`);
+        } catch {
+          /* */
+        }
+      }
+    }
     const statements = [
       `CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
@@ -112,11 +172,18 @@ export class GitPostStore extends DurableObject<Env> {
         email TEXT,
         bio TEXT,
         password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'member',
+        disabled INTEGER DEFAULT 0,
+        failed_logins INTEGER DEFAULT 0,
+        locked_until TEXT,
         created_at TEXT NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
+        user_agent TEXT,
+        ip TEXT,
+        created_at TEXT,
         expires_at TEXT NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS posts (
@@ -177,77 +244,99 @@ export class GitPostStore extends DurableObject<Env> {
         created_at TEXT,
         updated_at TEXT
       )`,
+      `CREATE TABLE IF NOT EXISTS invites (
+        code TEXT PRIMARY KEY,
+        created_by TEXT,
+        used_by TEXT,
+        created_at TEXT,
+        expires_at TEXT,
+        used_at TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS audits (
+        id TEXT PRIMARY KEY,
+        actor TEXT,
+        action TEXT,
+        target TEXT,
+        detail TEXT,
+        created_at TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )`,
       `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
     ];
     for (const stmt of statements) {
       this.ctx.storage.sql.exec(stmt);
     }
-    const seeded = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "seeded");
-    if (!seeded) await this.seed();
+    const seeded = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "seed_version");
+    if (!seeded || seeded.value !== SEED_VERSION) await this.seed();
+  }
+
+  private setting(key: string, fallback: string): string {
+    return this.one<{ value: string }>("SELECT value FROM settings WHERE key = ?", key)?.value || fallback;
+  }
+
+  private setSetting(key: string, value: string) {
+    this.sql("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value);
+  }
+
+  private audit(actor: string, action: string, target = "", detail = "") {
+    this.sql(
+      "INSERT INTO audits (id, actor, action, target, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      hex(6),
+      actor,
+      action,
+      target,
+      detail,
+      new Date().toISOString(),
+    );
   }
 
   private async seed() {
-    for (const u of DEMO_USERS) {
-      await this.createUser(u.handle, u.name, u.email, u.bio, u.password);
-    }
-    const created: Record<string, string> = {};
-    for (const p of SEED_POSTS) {
-      const user = this.one<User>("SELECT * FROM users WHERE handle = ?", p.owner);
-      if (!user) continue;
-      const when = new Date(
-        Date.now() - (p.daysAgo || 0) * 86400000 - (p.hoursAgo || 0) * 3600000,
-      ).toISOString();
-      const post = await this.createPost(user, p.subject, p.body, p.story ? (p.story as { url?: string }).url || "" : "", p.story || null, when);
-      created[p.subject] = post.id;
-      if (p.edits) {
-        for (const body of p.edits) {
-          await this.amendPost(post.id, user, p.subject, body, p.story || null);
-        }
-      }
-    }
-    const adaForce = created["I force-pushed to main and lived to tell the tale"];
-    const maya = this.one<User>("SELECT * FROM users WHERE handle = ?", "maya");
-    if (adaForce && maya) {
-      const fork = await this.forkPost(adaForce, maya);
-      const extra =
-        SEED_POSTS[0].edits?.[1] +
-        `\n\n**Maya's edit.** Add this to the recovery list: message the people who had the old tip *before* you push the rescue branch. Reflog saves objects. It does not save trust.`;
-      await this.amendPost(fork.id, maya, SEED_POSTS[0].subject, extra, null);
-      await this.openPR(maya, "Add a note about telling people before you rescue", "Small amendment to the recovery section. The reflog steps are right; the social step was missing.", fork.id, adaForce);
-      this.sql("INSERT OR IGNORE INTO stars (post_id, handle) VALUES (?, ?)", adaForce, "maya");
-      this.sql("INSERT OR IGNORE INTO stars (post_id, handle) VALUES (?, ?)", adaForce, "linus");
-      this.sql("INSERT OR IGNORE INTO stars (post_id, handle) VALUES (?, ?)", adaForce, "guest");
-      this.sql("INSERT OR IGNORE INTO watches (post_id, handle) VALUES (?, ?)", adaForce, "maya");
-    }
-    const cookiePost = created["How the session cookie stopped being a footgun"];
-    if (cookiePost) {
-      this.sql("INSERT OR IGNORE INTO stars (post_id, handle) VALUES (?, ?)", cookiePost, "ada");
-      this.sql("INSERT OR IGNORE INTO stars (post_id, handle) VALUES (?, ?)", cookiePost, "linus");
-    }
-    this.sql("INSERT INTO meta (key, value) VALUES ('seeded', '1')");
+    const pw = this.env.ADMIN_PASSWORD || "";
+    if (!pw) throw new Error("ADMIN_PASSWORD is required to seed the super admin");
+    await this.createUser(ADMIN_HANDLE, ADMIN_NAME, ADMIN_EMAIL, ADMIN_BIO, pw, "superadmin");
+    this.setSetting("signupMode", "invite");
+    this.setSetting("minPassword", "12");
+    this.audit("system", "bootstrap", ADMIN_HANDLE, "seeded super admin");
+    this.sql("INSERT OR REPLACE INTO meta (key, value) VALUES ('seed_version', ?)", SEED_VERSION);
   }
 
-  private async createUser(handle: string, name: string, email: string, bio: string, password: string) {
+  private async createUser(handle: string, name: string, email: string, bio: string, password: string, role = "member") {
     handle = handle.toLowerCase().trim();
     if (!handle || !password) throw new Error("bad request");
     if (this.one("SELECT id FROM users WHERE handle = ?", handle)) throw new Error("conflict");
     const id = hex(8);
     const now = new Date().toISOString();
     this.sql(
-      "INSERT INTO users (id, handle, name, email, bio, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO users (id, handle, name, email, bio, password_hash, role, disabled, failed_logins, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
       id,
       handle,
       name || handle,
       email || `${handle}@gitpo.st`,
       bio || "",
       await hashPass(password),
+      role,
       now,
     );
     return this.one<User>("SELECT * FROM users WHERE id = ?", id)!;
   }
 
   private publicUser(u: User) {
-    return { id: u.id, handle: u.handle, name: u.name, email: u.email, bio: u.bio, createdAt: u.created_at };
+    const role = u.role || "member";
+    return {
+      id: u.id,
+      handle: u.handle,
+      name: u.name,
+      email: u.email,
+      bio: u.bio,
+      role,
+      disabled: !!u.disabled,
+      isAdmin: role === "admin" || role === "superadmin",
+      isSuperAdmin: role === "superadmin",
+      createdAt: u.created_at,
+    };
   }
 
   private userBySession(token: string | null): User | null {
@@ -257,7 +346,9 @@ export class GitPostStore extends DurableObject<Env> {
       token,
     );
     if (!s || s.expires_at < new Date().toISOString()) return null;
-    return this.one<User>("SELECT * FROM users WHERE id = ?", s.user_id);
+    const u = this.one<User>("SELECT * FROM users WHERE id = ?", s.user_id);
+    if (!u || u.disabled) return null;
+    return u;
   }
 
   private findPost(ref: string) {
@@ -435,6 +526,212 @@ export class GitPostStore extends DurableObject<Env> {
     return this.one<any>("SELECT * FROM prs WHERE id = ?", id);
   }
 
+  private issueSession(u: User, req: Request, status: number): Response {
+    const token = hex(24);
+    const now = new Date().toISOString();
+    const exp = new Date(Date.now() + 30 * 86400000).toISOString();
+    this.sql(
+      "INSERT INTO sessions (token, user_id, user_agent, ip, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+      token,
+      u.id,
+      req.headers.get("User-Agent") || "",
+      req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "",
+      now,
+      exp,
+    );
+    return json({ user: this.publicUser(u) }, status, { "set-cookie": cookie(token) });
+  }
+
+  private async handleSecurity(path: string, method: string, req: Request, viewer: User | null): Promise<Response | null> {
+    if (path === "/api/security/password" && method === "POST") {
+      if (!viewer) return err(401, "unauthorized");
+      const inb = await req.json<any>();
+      if (!(await checkPass(viewer.password_hash, inb.current || ""))) return err(401, "unauthorized");
+      const weak = validatePassword(inb.next || "", Number(this.setting("minPassword", "12")) || 12);
+      if (weak) return err(400, weak);
+      this.sql("UPDATE users SET password_hash = ? WHERE id = ?", await hashPass(inb.next), viewer.id);
+      this.sql("DELETE FROM sessions WHERE user_id = ?", viewer.id);
+      this.audit(viewer.handle, "password.change", viewer.handle, "");
+      return this.issueSession({ ...viewer, password_hash: "" }, req, 200);
+    }
+    if (path === "/api/security/sessions" && method === "GET") {
+      if (!viewer) return err(401, "unauthorized");
+      const cur = readCookie(req, "gp_session");
+      const sessions = this.sql<any>("SELECT * FROM sessions WHERE user_id = ? AND expires_at > ?", viewer.id, new Date().toISOString()).map((s) => ({
+        id: String(s.token).slice(0, 12),
+        token: s.token,
+        ip: s.ip,
+        userAgent: s.user_agent,
+        createdAt: s.created_at,
+        expiresAt: s.expires_at,
+        current: s.token === cur,
+      }));
+      return json({ sessions });
+    }
+    if (path === "/api/security/sessions/revoke-all" && method === "POST") {
+      if (!viewer) return err(401, "unauthorized");
+      const cur = readCookie(req, "gp_session");
+      this.sql("DELETE FROM sessions WHERE user_id = ? AND token != ?", viewer.id, cur || "");
+      this.audit(viewer.handle, "session.revoke_all", viewer.handle, "");
+      return json({ ok: true });
+    }
+    const one = path.match(/^\/api\/security\/sessions\/(.+)$/);
+    if (one && method === "DELETE") {
+      if (!viewer) return err(401, "unauthorized");
+      const token = decodeURIComponent(one[1]);
+      const s = this.one<any>("SELECT * FROM sessions WHERE token = ?", token);
+      if (!s || s.user_id !== viewer.id) return err(404, "not found");
+      this.sql("DELETE FROM sessions WHERE token = ?", token);
+      return json({ ok: true });
+    }
+    return null;
+  }
+
+  private async handleAdmin(path: string, method: string, req: Request, viewer: User | null): Promise<Response | null> {
+    if (!path.startsWith("/api/admin/")) return null;
+    if (!viewer) return err(401, "unauthorized");
+    if (!isAdmin(viewer)) return err(403, "forbidden");
+
+    if (path === "/api/admin/overview" && method === "GET") {
+      const users = this.sql<User>("SELECT * FROM users");
+      return json({
+        users: users.length,
+        disabled: users.filter((u) => u.disabled).length,
+        admins: users.filter((u) => isAdmin(u)).length,
+        posts: this.sql("SELECT id FROM posts").length,
+        sessions: this.sql("SELECT token FROM sessions").length,
+        invites: this.sql("SELECT code FROM invites").length,
+        settings: { signupMode: this.setting("signupMode", "invite"), minPassword: Number(this.setting("minPassword", "12")) },
+      });
+    }
+    if (path === "/api/admin/users" && method === "GET") {
+      const users = this.sql<User>("SELECT * FROM users").map((u) => ({
+        ...this.publicUser(u),
+        failedLogins: u.failed_logins || 0,
+        lockedUntil: u.locked_until || null,
+      }));
+      return json({ users });
+    }
+    const dis = path.match(/^\/api\/admin\/users\/([^/]+)\/(disable|enable)$/);
+    if (dis && method === "POST") {
+      const handle = dis[1].toLowerCase();
+      const u = this.one<User>("SELECT * FROM users WHERE handle = ?", handle);
+      if (!u) return err(404, "not found");
+      if (isSuper(u)) return err(403, "cannot modify the super admin");
+      const off = dis[2] === "disable" ? 1 : 0;
+      this.sql("UPDATE users SET disabled = ? WHERE id = ?", off, u.id);
+      if (off) this.sql("DELETE FROM sessions WHERE user_id = ?", u.id);
+      this.audit(viewer.handle, off ? "user.disable" : "user.enable", handle, "");
+      return json({ ok: true });
+    }
+    const delu = path.match(/^\/api\/admin\/users\/([^/]+)$/);
+    if (delu && method === "DELETE") {
+      if (!isSuper(viewer)) return err(403, "forbidden");
+      const u = this.one<User>("SELECT * FROM users WHERE handle = ?", delu[1].toLowerCase());
+      if (!u) return err(404, "not found");
+      if (isSuper(u)) return err(403, "cannot modify the super admin");
+      this.sql("DELETE FROM sessions WHERE user_id = ?", u.id);
+      this.sql("DELETE FROM users WHERE id = ?", u.id);
+      this.audit(viewer.handle, "user.delete", u.handle, "");
+      return json({ ok: true });
+    }
+    const role = path.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
+    if (role && method === "POST") {
+      if (!isSuper(viewer)) return err(403, "forbidden");
+      const inb = await req.json<any>();
+      if (inb.role !== "admin" && inb.role !== "member") return err(400, "bad request");
+      const u = this.one<User>("SELECT * FROM users WHERE handle = ?", role[1].toLowerCase());
+      if (!u) return err(404, "not found");
+      if (isSuper(u)) return err(403, "cannot modify the super admin");
+      this.sql("UPDATE users SET role = ? WHERE id = ?", inb.role, u.id);
+      this.audit(viewer.handle, "user.role", u.handle, inb.role);
+      return json({ ok: true });
+    }
+    if (path === "/api/admin/invites" && method === "GET") {
+      const invites = this.sql<any>("SELECT * FROM invites").map((i) => ({
+        code: i.code,
+        createdBy: i.created_by,
+        usedBy: i.used_by,
+        createdAt: i.created_at,
+        expiresAt: i.expires_at,
+        usedAt: i.used_at,
+      }));
+      return json({ invites });
+    }
+    if (path === "/api/admin/invites" && method === "POST") {
+      const inb = await req.json<any>().catch(() => ({ days: 14 }));
+      const days = inb.days > 0 && inb.days <= 90 ? inb.days : 14;
+      const code = hex(10);
+      const now = new Date();
+      this.sql(
+        "INSERT INTO invites (code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        code,
+        viewer.handle,
+        now.toISOString(),
+        new Date(now.getTime() + days * 86400000).toISOString(),
+      );
+      this.audit(viewer.handle, "invite.create", code.slice(0, 8), "");
+      return json({ invite: { code, createdBy: viewer.handle, createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + days * 86400000).toISOString() } }, 201);
+    }
+    const rev = path.match(/^\/api\/admin\/invites\/([^/]+)$/);
+    if (rev && method === "DELETE") {
+      this.sql("DELETE FROM invites WHERE code = ?", rev[1]);
+      this.audit(viewer.handle, "invite.revoke", rev[1].slice(0, 8), "");
+      return json({ ok: true });
+    }
+    if (path === "/api/admin/audit" && method === "GET") {
+      const events = this.sql<any>("SELECT * FROM audits ORDER BY created_at DESC LIMIT 200").map((e) => ({
+        id: e.id,
+        actor: e.actor,
+        action: e.action,
+        target: e.target,
+        detail: e.detail,
+        createdAt: e.created_at,
+      }));
+      return json({ events });
+    }
+    if (path === "/api/admin/sessions" && method === "GET") {
+      const sessions = this.sql<any>("SELECT * FROM sessions").map((s) => {
+        const u = this.one<User>("SELECT * FROM users WHERE id = ?", s.user_id);
+        return {
+          token: s.token,
+          handle: u?.handle || "",
+          ip: s.ip,
+          userAgent: s.user_agent,
+          createdAt: s.created_at,
+          expiresAt: s.expires_at,
+        };
+      });
+      return json({ sessions });
+    }
+    const kick = path.match(/^\/api\/admin\/sessions\/(.+)$/);
+    if (kick && method === "DELETE") {
+      this.sql("DELETE FROM sessions WHERE token = ?", decodeURIComponent(kick[1]));
+      this.audit(viewer.handle, "session.revoke", "", "");
+      return json({ ok: true });
+    }
+    if (path === "/api/admin/settings" && method === "GET") {
+      return json({ settings: { signupMode: this.setting("signupMode", "invite"), minPassword: Number(this.setting("minPassword", "12")) } });
+    }
+    if (path === "/api/admin/settings" && method === "PUT") {
+      const inb = await req.json<any>();
+      if (inb.signupMode && ["invite", "open", "closed"].includes(inb.signupMode)) this.setSetting("signupMode", inb.signupMode);
+      if (inb.minPassword >= 12 && inb.minPassword <= 64) this.setSetting("minPassword", String(inb.minPassword));
+      this.audit(viewer.handle, "settings.update", "", this.setting("signupMode", "invite"));
+      return json({ settings: { signupMode: this.setting("signupMode", "invite"), minPassword: Number(this.setting("minPassword", "12")) } });
+    }
+    const delp = path.match(/^\/api\/admin\/posts\/([^/]+)$/);
+    if (delp && method === "DELETE") {
+      const p = this.findPost(delp[1]);
+      if (!p) return err(404, "not found");
+      this.sql("DELETE FROM posts WHERE id = ?", p.id);
+      this.sql("DELETE FROM commits WHERE post_id = ?", p.id);
+      this.audit(viewer.handle, "post.delete", p.id, p.subject);
+      return json({ ok: true });
+    }
+    return err(404, "not found");
+  }
+
   async fetch(req: Request): Promise<Response> {
     await this.ready;
     const url = new URL(req.url);
@@ -451,23 +748,49 @@ export class GitPostStore extends DurableObject<Env> {
         return json({ user: viewer ? this.publicUser(viewer) : null });
       }
 
+      if (path === "/api/auth/config" && method === "GET") {
+        return json({
+          signupMode: this.setting("signupMode", "invite"),
+          minPassword: Number(this.setting("minPassword", "12")) || 12,
+        });
+      }
+
       if (path === "/api/auth/register" && method === "POST") {
         const inb = await req.json<any>();
+        const mode = this.setting("signupMode", "invite");
+        if (mode === "closed") return err(403, "registration is closed");
+        const min = Number(this.setting("minPassword", "12")) || 12;
+        const weak = validatePassword(inb.password || "", min);
+        if (weak) return err(400, weak);
+        if (mode === "invite") {
+          const code = String(inb.invite || "").trim();
+          const inv = this.one<any>("SELECT * FROM invites WHERE code = ?", code);
+          if (!inv || inv.used_by || inv.expires_at < new Date().toISOString()) return err(400, "invite code is invalid or expired");
+          const u = await this.createUser(inb.handle, inb.name, inb.email, inb.bio, inb.password);
+          this.sql("UPDATE invites SET used_by = ?, used_at = ? WHERE code = ?", u.handle, new Date().toISOString(), code);
+          this.audit("system", "user.register", u.handle, "");
+          return this.issueSession(u, req, 201);
+        }
         const u = await this.createUser(inb.handle, inb.name, inb.email, inb.bio, inb.password);
-        const token = hex(24);
-        const exp = new Date(Date.now() + 30 * 86400000).toISOString();
-        this.sql("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", token, u.id, exp);
-        return json({ user: this.publicUser(u) }, 201, { "set-cookie": cookie(token) });
+        this.audit("system", "user.register", u.handle, "");
+        return this.issueSession(u, req, 201);
       }
 
       if (path === "/api/auth/login" && method === "POST") {
         const inb = await req.json<any>();
         const u = this.one<User>("SELECT * FROM users WHERE handle = ?", String(inb.handle || "").toLowerCase());
-        if (!u || u.password_hash !== (await hashPass(inb.password || ""))) return err(401, "unauthorized");
-        const token = hex(24);
-        const exp = new Date(Date.now() + 30 * 86400000).toISOString();
-        this.sql("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", token, u.id, exp);
-        return json({ user: this.publicUser(u) }, 200, { "set-cookie": cookie(token) });
+        if (!u) return err(401, "unauthorized");
+        if (u.disabled) return err(403, "account disabled");
+        if (u.locked_until && u.locked_until > new Date().toISOString()) return err(429, "account temporarily locked");
+        if (!(await checkPass(u.password_hash, inb.password || ""))) {
+          const fails = (u.failed_logins || 0) + 1;
+          const lock = fails >= 5 ? new Date(Date.now() + 15 * 60 * 1000).toISOString() : null;
+          this.sql("UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?", fails, lock, u.id);
+          if (lock) return err(429, "account temporarily locked");
+          return err(401, "unauthorized");
+        }
+        this.sql("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?", u.id);
+        return this.issueSession(u, req, 200);
       }
 
       if (path === "/api/auth/logout" && method === "POST") {
@@ -713,6 +1036,11 @@ export class GitPostStore extends DurableObject<Env> {
         if (!st) return err(400, "bad request");
         return json({ story: st });
       }
+
+      const sec = await this.handleSecurity(path, method, req, viewer);
+      if (sec) return sec;
+      const adm = await this.handleAdmin(path, method, req, viewer);
+      if (adm) return adm;
 
       return err(404, "not found");
     } catch (e: any) {

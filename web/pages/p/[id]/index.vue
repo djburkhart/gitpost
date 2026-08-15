@@ -32,6 +32,7 @@
       <NuxtLink v-if="mine" :to="`/p/${post.id}/edit`" class="btn btn-sm">Amend</NuxtLink>
       <button v-if="canPR" class="btn btn-sm" @click="openPR">Open pull request</button>
       <button v-if="mine && cherrySha" class="btn btn-sm" @click="doCherry">Cherry-pick {{ cherrySha.slice(0, 7) }}</button>
+      <button v-if="user?.isAdmin" class="btn btn-sm btn-danger" type="button" @click="adminDelete">Remove post</button>
     </div>
     <p v-if="notice" class="subtle">{{ notice }}</p>
     <p v-if="error" style="color: var(--del)">{{ error }}</p>
@@ -270,6 +271,17 @@ async function doCherry() {
     notice.value = `Cherry-picked ${cherrySha.value.slice(0, 7)}`;
     cherrySha.value = "";
     await load();
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
+
+async function adminDelete() {
+  if (!confirm("Permanently remove this post?")) return;
+  error.value = "";
+  try {
+    await api(`/api/admin/posts/${post.value.id}`, { method: "DELETE" });
+    await navigateTo("/");
   } catch (e: any) {
     error.value = e.message;
   }

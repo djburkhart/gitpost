@@ -2,6 +2,9 @@
 set -eu
 cd /workspace
 export PATH="/usr/local/go/bin:${PATH}"
+if [ -f /workspace/data/.admin-password ]; then
+  export GITPOST_ADMIN_PASSWORD="$(tr -d '\n' < /workspace/data/.admin-password)"
+fi
 export GITPOST_DATA="${GITPOST_DATA:-/workspace/data}"
 export GITPOST_ADDR="${GITPOST_ADDR:-127.0.0.1:8090}"
 
