@@ -2,6 +2,7 @@
   "$schema": "https://unpkg.com/wrangler@4.123.0/config-schema.json",
   "name": "gitpost",
   "main": "worker/src/index.ts",
+  "account_id": "27d8d4a40eb1c3ac95f085d85d60d462",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,

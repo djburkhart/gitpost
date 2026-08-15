@@ -33,9 +33,8 @@ Do not commit `.dev.vars` or `data/.admin-password`.
 
 ## GitHub Actions
 
-Required repository secrets:
+Repo secret required:
 
-- `CLOUDFLARE_API_TOKEN` — token with Workers edit
-- `CLOUDFLARE_ACCOUNT_ID` — from the Cloudflare dashboard (Workers overview)
+- `CLOUDFLARE_API_TOKEN` — create at https://dash.cloudflare.com/profile/api-tokens using the **Edit Cloudflare Workers** template (must include **Workers Scripts: Edit**). A Pages-only or zone-read token will fail with authentication error 10000.
 
-If the account ID secret is missing, the workflow tries to resolve it from the token.
+`account_id` is already in `wrangler.jsonc`. Optional secret `CLOUDFLARE_ACCOUNT_ID` overrides it.
