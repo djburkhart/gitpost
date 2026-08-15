@@ -61,8 +61,11 @@
         <p v-if="!paragraphs.length" class="empty">No paragraphs to propose against yet.</p>
       </template>
       <template v-else>
-        <p class="subtle blame-hint">Hover a paragraph to see who last changed it.</p>
-        <BlameBody :post-id="post.id" :fallback="post.body" />
+        <TakeCarousel :takes="forks" :parent-id="post.parentPostId" />
+        <p class="subtle blame-hint">Hover a paragraph for blame. Select a sentence to cherry-pick it.</p>
+        <div class="read-body" @mouseup="onSelect" @keyup="onSelect">
+          <BlameBody :post-id="post.id" :fallback="post.body" />
+        </div>
         <StoryEmbed v-if="post.story" :story="post.story" />
       </template>
     </section>
@@ -125,6 +128,10 @@
       <DiffView :diff="diverge?.diff || ''" empty-label="This take still matches the parent." />
     </section>
 
+    <section v-else-if="tab === 'discuss'">
+      <DiscussThread :post-id="post.id" :mine="!!mine" />
+    </section>
+
     <section v-else-if="tab === 'takes'">
       <p class="muted" style="margin-top: 0">Other branches of this idea. Each fork carries an intent.</p>
       <ul class="log-list">
@@ -178,6 +185,15 @@
     </section>
 
     <ForkSheet v-if="showFork" :post-id="post.id" @close="showFork = false" @forked="onForked" />
+    <CherryPickSheet
+      v-if="excerpt"
+      :source-id="post.id"
+      :source-owner="post.owner"
+      :source-sha="post.shortSha"
+      :excerpt="excerpt"
+      @close="excerpt = ''"
+      @picked="onPicked"
+    />
     <ParagraphPropose
       v-if="proposal"
       :post-id="post.id"
@@ -205,6 +221,7 @@ const tabs = [
   { id: "history", label: "History" },
   { id: "diff", label: "Diff" },
   { id: "diverge", label: "Diverge" },
+  { id: "discuss", label: "Discuss" },
   { id: "takes", label: "Takes" },
   { id: "branches", label: "Branches" },
   { id: "pulls", label: "Pulls" },
@@ -228,6 +245,7 @@ const showFork = ref(false);
 const proposeMode = ref(false);
 const proposal = ref<{ index: number; text: string } | null>(null);
 const remotes = ref<string[]>([]);
+const excerpt = ref("");
 
 const followingAll = computed(() => {
   const topics: string[] = post.value?.topics || [];
@@ -326,6 +344,22 @@ function startFork() {
 function onForked(id: string) {
   showFork.value = false;
   navigateTo(`/p/${id}/edit`);
+}
+
+function onSelect() {
+  if (!user.value) return;
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return;
+  const text = sel.toString().replace(/\s+\n/g, "\n").trim();
+  if (text.length < 8 || text.length > 8000) return;
+  const root = document.querySelector(".read-body");
+  if (!root || !sel.anchorNode || !root.contains(sel.anchorNode)) return;
+  excerpt.value = text;
+}
+
+function onPicked(id: string) {
+  excerpt.value = "";
+  navigateTo(`/p/${id}`);
 }
 
 async function togglePropose() {

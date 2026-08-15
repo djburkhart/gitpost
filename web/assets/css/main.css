@@ -1602,3 +1602,86 @@ html.wysimark-on {
     grid-template-columns: 28px 1fr;
   }
 }
+
+.take-carousel {
+  margin: 0 0 var(--space-6);
+}
+
+.take-strip {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  padding: 4px 2px 12px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.take-card {
+  flex: 0 0 min(260px, 78vw);
+  scroll-snap-align: start;
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--fg) 10%, transparent);
+  text-decoration: none;
+  color: inherit;
+  min-height: 120px;
+  align-content: start;
+}
+
+.take-card strong {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 400;
+  letter-spacing: var(--tracking-display);
+  line-height: var(--leading-snug);
+}
+
+.take-card:hover {
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--fg) 18%, transparent);
+}
+
+.excerpt-preview {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-left: 2px solid var(--sha);
+  background: var(--bg-subtle);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+}
+
+.thread {
+  margin: 20px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.comment.reply {
+  margin-left: 18px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border-strong);
+}
+
+.comment.branched {
+  opacity: 0.78;
+}
+
+.comment-form {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.para-edit {
+  width: 100%;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font: inherit;
+  resize: vertical;
+}

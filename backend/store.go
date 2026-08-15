@@ -208,8 +208,9 @@ type persisted struct {
 	Audits   []AuditEvent  `json:"audits"`
 	Settings Settings      `json:"settings"`
 	PRSeq    int           `json:"prSeq"`
-	Events   []Activity    `json:"events"`
+	Events   []Activity     `json:"events"`
 	Remotes  []RemoteFollow `json:"remotes"`
+	Comments []PostComment  `json:"comments"`
 }
 
 type Store struct {
@@ -227,6 +228,7 @@ type Store struct {
 	prSeq    int
 	events   []Activity
 	remotes  map[string][]string
+	comments []PostComment
 }
 
 func NewStore(root string) (*Store, error) {
@@ -303,6 +305,7 @@ func (s *Store) load() error {
 	for _, r := range p.Remotes {
 		s.remotes[r.Handle] = append(s.remotes[r.Handle], r.Topic)
 	}
+	s.comments = p.Comments
 	return nil
 }
 
@@ -328,6 +331,7 @@ func (s *Store) save() error {
 	p.Audits = s.audits
 	p.Settings = s.settings
 	p.Events = s.events
+	p.Comments = s.comments
 	for handle, topics := range s.remotes {
 		for _, t := range topics {
 			p.Remotes = append(p.Remotes, RemoteFollow{Handle: handle, Topic: t})
@@ -1394,7 +1398,12 @@ func (s *Store) ListForks(id string) []Post {
 			out = append(out, cp)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].Stars) != len(out[j].Stars) {
+			return len(out[i].Stars) > len(out[j].Stars)
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
 	return out
 }
 

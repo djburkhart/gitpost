@@ -446,15 +446,18 @@ func (s *Server) handleForks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errNotFound)
 		return
 	}
-	list := s.store.ListForks(p.ID)
+	list := s.store.ListTakes(p.ID)
+	if r.URL.Query().Get("children") == "1" {
+		list = s.store.ListForks(p.ID)
+	}
 	viewer := s.currentUser(r)
-	out := make([]map[string]any, 0, len(list))
+	out := []map[string]any{}
 	for i := range list {
 		item := postPayload(&list[i], viewer)
 		delete(item, "body")
 		out = append(out, item)
 	}
-	writeJSON(w, 200, map[string]any{"forks": out})
+	writeJSON(w, 200, map[string]any{"forks": out, "takes": out})
 }
 
 func (s *Server) handleDiverge(w http.ResponseWriter, r *http.Request) {
@@ -714,6 +717,75 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		items = append(items, item)
 	}
 	writeJSON(w, 200, map[string]any{"user": u.Public(), "posts": items})
+}
+
+func (s *Server) handleCherryPickExcerpt(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		SourceID string `json:"sourceId"`
+		DestID   string `json:"destId"`
+		Excerpt  string `json:"excerpt"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	src := in.SourceID
+	if src == "" {
+		src = r.PathValue("id")
+	}
+	p, err := s.store.CherryPickExcerpt(in.DestID, src, in.Excerpt, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"comments": s.store.ListComments(p.ID)})
+}
+
+func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Body     string `json:"body"`
+		ParentID string `json:"parentId"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	c, err := s.store.AddComment(r.PathValue("id"), in.ParentID, in.Body, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"comment": c})
+}
+
+func (s *Server) handleBranchDiscussion(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	b, err := s.store.BranchDiscussion(r.PathValue("id"), r.PathValue("cid"), u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"branch": b})
 }
 
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {

@@ -83,6 +83,10 @@ func main() {
 	mux.HandleFunc("POST /api/posts/{id}/branches", s.handleCreateBranch)
 	mux.HandleFunc("POST /api/posts/{id}/checkout", s.handleCheckout)
 	mux.HandleFunc("POST /api/posts/{id}/cherry-pick", s.handleCherryPick)
+	mux.HandleFunc("POST /api/posts/{id}/excerpt", s.handleCherryPickExcerpt)
+	mux.HandleFunc("GET /api/posts/{id}/comments", s.handleListComments)
+	mux.HandleFunc("POST /api/posts/{id}/comments", s.handleAddComment)
+	mux.HandleFunc("POST /api/posts/{id}/comments/{cid}/branch", s.handleBranchDiscussion)
 
 	mux.HandleFunc("GET /api/prs", s.handleListPRs)
 	mux.HandleFunc("POST /api/prs", s.handleCreatePR)

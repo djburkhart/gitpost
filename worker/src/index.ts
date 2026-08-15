@@ -322,6 +322,15 @@ export class GitPostStore extends DurableObject<Env> {
         actor TEXT,
         created_at TEXT
       )`,
+      `CREATE TABLE IF NOT EXISTS comments (
+        id TEXT PRIMARY KEY,
+        post_id TEXT NOT NULL,
+        parent_id TEXT,
+        author TEXT,
+        body TEXT,
+        branch TEXT,
+        created_at TEXT
+      )`,
       `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
     ];
     for (const stmt of statements) {
@@ -900,6 +909,24 @@ export class GitPostStore extends DurableObject<Env> {
     return err(404, "not found");
   }
 
+  private listTakes(id: string) {
+    const p = this.findPost(id);
+    if (!p) return [];
+    const root = p.parent_post_id || id;
+    const posts = this.sql<any>("SELECT * FROM posts");
+    const out = posts.filter((other) => {
+      if (other.id === id) return false;
+      return other.parent_post_id === id || other.parent_post_id === root || other.id === root;
+    });
+    out.sort((a, b) => {
+      const sa = this.sql("SELECT handle FROM stars WHERE post_id = ?", a.id).length;
+      const sb = this.sql("SELECT handle FROM stars WHERE post_id = ?", b.id).length;
+      if (sa !== sb) return sb - sa;
+      return String(b.updated_at).localeCompare(String(a.updated_at));
+    });
+    return out;
+  }
+
   private buildGraph() {
     const posts = this.sql<any>("SELECT * FROM posts ORDER BY updated_at DESC");
     const prs = this.sql<any>("SELECT * FROM prs WHERE status = 'merged' AND IFNULL(kind,'full') != 'paragraph'");
@@ -1259,12 +1286,108 @@ export class GitPostStore extends DurableObject<Env> {
         }
 
         if (rest === "forks" && method === "GET") {
-          const forks = this.sql<any>("SELECT * FROM posts WHERE parent_post_id = ? ORDER BY updated_at DESC", p.id).map((row) => {
+          const takes = this.listTakes(p.id).map((row) => {
             const item = this.postPayload(row, viewer);
             delete (item as any).body;
             return item;
           });
-          return json({ forks });
+          return json({ forks: takes, takes });
+        }
+
+        if (rest === "excerpt" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const inb = await req.json<any>();
+          const excerpt = String(inb.excerpt || "").trim();
+          if (!excerpt || excerpt.length > 8000) return err(400, "bad request");
+          const quoted = excerpt.split("\n").map((l) => "> " + l.replace(/\s+$/, "")).join("\n");
+          const attr = `${quoted}\n\nCherry-picked from @${p.owner} \`${shortSha(p.head_sha || "")}\` — ${p.subject}`;
+          if (!inb.destId) {
+            let subject = "Cherry-pick: " + p.subject;
+            if (subject.length > 72) subject = subject.slice(0, 69) + "…";
+            const created = await this.createPost(viewer, subject, attr, "", null, parseTopics(p.topics_json));
+            this.recordEvent("cherry", created.id, created.head_sha, viewer.handle);
+            this.recordEvent("cherry", p.id, p.head_sha, viewer.handle);
+            return json({ post: this.postPayload(created, viewer) }, 201);
+          }
+          const dest = this.findPost(inb.destId);
+          if (!dest) return err(404, "not found");
+          if (dest.owner !== viewer.handle) return err(403, "forbidden");
+          const body = dest.body ? dest.body.trim() + "\n\n" + attr : attr;
+          const np = await this.amendPost(dest.id, viewer, dest.subject, body, dest.story_json ? JSON.parse(dest.story_json) : null);
+          this.recordEvent("cherry", dest.id, np.head_sha, viewer.handle);
+          this.recordEvent("cherry", p.id, p.head_sha, viewer.handle);
+          return json({ post: this.postPayload(np, viewer) }, 201);
+        }
+
+        if (rest === "comments" && method === "GET") {
+          const comments = this.sql<any>("SELECT * FROM comments WHERE post_id = ? ORDER BY created_at ASC", p.id).map((c) => ({
+            id: c.id,
+            postId: c.post_id,
+            parentId: c.parent_id || "",
+            author: c.author,
+            body: c.body,
+            branch: c.branch || "",
+            createdAt: c.created_at,
+          }));
+          return json({ comments });
+        }
+
+        if (rest === "comments" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const inb = await req.json<any>();
+          const body = String(inb.body || "").trim();
+          if (!body || body.length > 4000) return err(400, "bad request");
+          const parentId = String(inb.parentId || "").trim();
+          if (parentId) {
+            const par = this.one<any>("SELECT id FROM comments WHERE id = ? AND post_id = ?", parentId, p.id);
+            if (!par) return err(404, "not found");
+          }
+          const id = hex(4);
+          const ts = new Date().toISOString();
+          this.sql(
+            "INSERT INTO comments (id, post_id, parent_id, author, body, branch, created_at) VALUES (?, ?, ?, ?, ?, '', ?)",
+            id, p.id, parentId, viewer.handle, body, ts,
+          );
+          return json({
+            comment: { id, postId: p.id, parentId, author: viewer.handle, body, branch: "", createdAt: ts },
+          }, 201);
+        }
+
+        const branchThread = rest.match(/^comments\/([^/]+)\/branch$/);
+        if (branchThread && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          if (p.owner !== viewer.handle) return err(403, "forbidden");
+          const rootId = branchThread[1];
+          const all = this.sql<any>("SELECT * FROM comments WHERE post_id = ?", p.id);
+          const byId = new Map(all.map((c) => [c.id, c]));
+          let root = byId.get(rootId);
+          if (!root) return err(404, "not found");
+          while (root.parent_id && byId.has(root.parent_id)) root = byId.get(root.parent_id);
+          const thread: any[] = [];
+          const walk = (id: string) => {
+            const c = byId.get(id);
+            if (!c) return;
+            thread.push(c);
+            for (const other of all) if (other.parent_id === id) walk(other.id);
+          };
+          walk(root.id);
+          const name = "discuss-" + root.id;
+          let md = (p.body || "").trim() + "\n\n---\n\n## Discussion\n\nPromoted from a comment thread so the main line stays readable.\n";
+          for (const c of thread) {
+            md += `\n### @${c.author} · ${(c.created_at || "").slice(0, 10)}\n\n${c.body}\n`;
+          }
+          let subject = "discuss: " + p.subject;
+          if (subject.length > 72) subject = subject.slice(0, 69) + "…";
+          const sha = await gitCommitSha(`discuss ${p.id} ${name} ${md}`);
+          this.sql(
+            "INSERT INTO commits (sha, post_id, subject, body, author, email, created_at, parent_sha, story_json, branch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            sha, p.id, subject, md, viewer.name, viewer.email, new Date().toISOString(), p.head_sha, p.story_json || "", name,
+          );
+          this.sql("INSERT OR REPLACE INTO branches (post_id, name, sha) VALUES (?, ?, ?)", p.id, name, sha);
+          for (const c of thread) {
+            this.sql("UPDATE comments SET branch = ? WHERE id = ?", name, c.id);
+          }
+          return json({ branch: { name, sha, author: viewer.handle } }, 201);
         }
 
         if (rest === "diverge" && method === "GET") {
