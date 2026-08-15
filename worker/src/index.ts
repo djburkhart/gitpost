@@ -271,6 +271,7 @@ export class GitPostStore extends DurableObject<Env> {
     }
     const seeded = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "seed_version");
     if (!seeded || seeded.value !== SEED_VERSION) await this.seed();
+    await this.ensureAdminPassword();
   }
 
   private setting(key: string, fallback: string): string {
@@ -301,6 +302,27 @@ export class GitPostStore extends DurableObject<Env> {
     this.setSetting("minPassword", "12");
     this.audit("system", "bootstrap", ADMIN_HANDLE, "seeded super admin");
     this.sql("INSERT OR REPLACE INTO meta (key, value) VALUES ('seed_version', ?)", SEED_VERSION);
+    this.sql("INSERT OR REPLACE INTO meta (key, value) VALUES ('admin_pw_fp', ?)", await shaHex("SHA-256", "admin-pw:" + pw));
+  }
+
+  private async ensureAdminPassword() {
+    const pw = this.env.ADMIN_PASSWORD || "";
+    if (!pw) return;
+    const fp = await shaHex("SHA-256", "admin-pw:" + pw);
+    const current = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "admin_pw_fp");
+    if (current?.value === fp) return;
+    const existing = this.one<User>("SELECT * FROM users WHERE handle = ?", ADMIN_HANDLE);
+    if (existing) {
+      this.sql(
+        "UPDATE users SET password_hash = ?, role = 'superadmin', disabled = 0, failed_logins = 0, locked_until = NULL WHERE handle = ?",
+        await hashPass(pw),
+        ADMIN_HANDLE,
+      );
+    } else {
+      await this.createUser(ADMIN_HANDLE, ADMIN_NAME, ADMIN_EMAIL, ADMIN_BIO, pw, "superadmin");
+    }
+    this.sql("INSERT OR REPLACE INTO meta (key, value) VALUES ('admin_pw_fp', ?)", fp);
+    this.audit("system", "admin-password", ADMIN_HANDLE, "synced from ADMIN_PASSWORD");
   }
 
   private async createUser(handle: string, name: string, email: string, bio: string, password: string, role = "member") {

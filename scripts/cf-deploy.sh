@@ -15,7 +15,14 @@ fi
 
 echo "Deploying Worker + assets…"
 if [ "$FLAG" = "--temporary" ]; then
-  npx wrangler deploy --temporary
+  if [ -n "${ADMIN_PASSWORD:-}" ]; then
+    npx wrangler deploy --temporary --var "ADMIN_PASSWORD:${ADMIN_PASSWORD}"
+  else
+    npx wrangler deploy --temporary
+  fi
 else
   npx wrangler deploy
+  if [ -n "${ADMIN_PASSWORD:-}" ]; then
+    printf '%s' "$ADMIN_PASSWORD" | npx wrangler secret put ADMIN_PASSWORD
+  fi
 fi
