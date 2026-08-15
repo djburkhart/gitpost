@@ -26,7 +26,69 @@ var (
 	errAlreadyApplied = errors.New("that commit is already in this history")
 	errCherryConflict = errors.New("cherry-pick conflicted with the current tip")
 	errGitFailed      = errors.New("that git action failed")
+	errParagraphDrift = errors.New("that paragraph has changed since this proposal")
 )
+
+var forkIntentLabels = map[string]string{
+	"counter-argument": "Counter-argument",
+	"extension":        "Extension",
+	"translation":      "Translation",
+	"simplification":   "Simplification",
+	"implementation":   "Implementation",
+}
+
+func normalizeIntent(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "-")
+	s = strings.ReplaceAll(s, "_", "-")
+	if s == "counterargument" {
+		s = "counter-argument"
+	}
+	if _, ok := forkIntentLabels[s]; !ok {
+		return "", errBadRequest
+	}
+	return s, nil
+}
+
+func splitParagraphs(body string) []string {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil
+	}
+	raw := strings.Split(body, "\n\n")
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func joinParagraphs(paras []string) string {
+	return strings.Join(paras, "\n\n")
+}
+
+func applyParagraph(body string, index int, original, proposed string) (string, error) {
+	original = strings.TrimSpace(original)
+	proposed = strings.TrimSpace(proposed)
+	if proposed == "" {
+		return "", errBadRequest
+	}
+	paras := splitParagraphs(body)
+	for i, p := range paras {
+		if p == original {
+			paras[i] = proposed
+			return joinParagraphs(paras), nil
+		}
+	}
+	if index >= 0 && index < len(paras) {
+		return "", errParagraphDrift
+	}
+	return "", errNotFound
+}
 
 type User struct {
 	ID           string     `json:"id"`
@@ -53,6 +115,8 @@ type Post struct {
 	Body          string    `json:"body,omitempty"`
 	ParentPostID  string    `json:"parentPostId,omitempty"`
 	ForkedFromSHA string    `json:"forkedFromSha,omitempty"`
+	ForkIntent    string    `json:"forkIntent,omitempty"`
+	ForkIntentNote string   `json:"forkIntentNote,omitempty"`
 	StoryURL      string    `json:"storyUrl,omitempty"`
 	Story         *Story    `json:"story,omitempty"`
 	Stars         []string  `json:"stars"`
@@ -101,8 +165,21 @@ type PullRequest struct {
 	TargetSHA    string     `json:"targetSha"`
 	Status       string     `json:"status"`
 	MergedSHA    string     `json:"mergedSha,omitempty"`
+	Kind         string     `json:"kind,omitempty"`
+	ParagraphIndex int      `json:"paragraphIndex,omitempty"`
+	Original     string     `json:"original,omitempty"`
+	Proposed     string     `json:"proposed,omitempty"`
+	Rationale    string     `json:"rationale,omitempty"`
+	ReviewNote   string     `json:"reviewNote,omitempty"`
+	Comments     []PRComment `json:"comments,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
 	UpdatedAt    time.Time  `json:"updatedAt"`
+}
+
+type PRComment struct {
+	Author    string    `json:"author"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 type BranchInfo struct {
@@ -829,12 +906,20 @@ func toggle(list []string, v string) []string {
 	return out
 }
 
-func (s *Store) Fork(id string, user *User) (*Post, error) {
+func (s *Store) Fork(id string, user *User, intent, note string) (*Post, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	src := s.posts[id]
 	if src == nil {
 		return nil, errNotFound
+	}
+	intent, err := normalizeIntent(intent)
+	if err != nil {
+		return nil, err
+	}
+	note = strings.TrimSpace(note)
+	if len(note) > 280 {
+		note = note[:280]
 	}
 	nid := idHex(5)
 	srcDir := s.repoDir(id)
@@ -850,21 +935,23 @@ func (s *Store) Fork(id string, user *User) (*Post, error) {
 	now := time.Now().UTC()
 	subject := src.Subject
 	// leave content as-is; fork commit records the fork
-	sha, err := s.commit(dstDir, user.Name, user.Email, "fork: "+subject, now)
+	sha, err := s.commit(dstDir, user.Name, user.Email, "fork("+intent+"): "+subject, now)
 	if err != nil {
 		return nil, err
 	}
 	p := &Post{
-		ID:            nid,
-		Owner:         user.Handle,
-		HeadSHA:       sha,
-		ShortSHA:      shortSHA(sha),
-		Subject:       subject,
-		Slug:          slugify(subject),
-		Body:          src.Body,
-		ParentPostID:  src.ID,
-		ForkedFromSHA: src.HeadSHA,
-		StoryURL:      src.StoryURL,
+		ID:             nid,
+		Owner:          user.Handle,
+		HeadSHA:        sha,
+		ShortSHA:       shortSHA(sha),
+		Subject:        subject,
+		Slug:           slugify(subject),
+		Body:           src.Body,
+		ParentPostID:   src.ID,
+		ForkedFromSHA:  src.HeadSHA,
+		ForkIntent:     intent,
+		ForkIntentNote: note,
+		StoryURL:       src.StoryURL,
 		Story:         src.Story,
 		Stars:         []string{},
 		Watchers:      []string{},
@@ -1013,36 +1100,89 @@ func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Pos
 	return dst, s.save()
 }
 
-func (s *Store) OpenPR(author *User, title, body, sourceID, targetID string) (*PullRequest, error) {
+func (s *Store) OpenPR(author *User, title, body, sourceID, targetID, kind string, paragraphIndex int, original, proposed, rationale string) (*PullRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	src := s.posts[sourceID]
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "" {
+		kind = "full"
+	}
+	if kind != "full" && kind != "paragraph" {
+		return nil, errBadRequest
+	}
 	dst := s.posts[targetID]
-	if src == nil || dst == nil {
+	if dst == nil {
 		return nil, errNotFound
 	}
-	if src.Owner != author.Handle {
-		return nil, errForbidden
+	var src *Post
+	if sourceID != "" {
+		src = s.posts[sourceID]
+		if src == nil {
+			return nil, errNotFound
+		}
 	}
-	if title == "" {
-		title = src.Subject
-	}
-	s.prSeq++
 	now := time.Now().UTC()
 	pr := &PullRequest{
-		ID:           idHex(4),
-		Number:       s.prSeq,
-		Title:        title,
-		Body:         body,
-		Author:       author.Handle,
-		TargetPostID: targetID,
-		SourcePostID: sourceID,
-		SourceSHA:    src.HeadSHA,
-		TargetSHA:    dst.HeadSHA,
-		Status:       "open",
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:             idHex(4),
+		Author:         author.Handle,
+		TargetPostID:   targetID,
+		Kind:           kind,
+		Status:         "open",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Rationale:      strings.TrimSpace(rationale),
+		ParagraphIndex: paragraphIndex,
+		Original:       strings.TrimSpace(original),
+		Proposed:       strings.TrimSpace(proposed),
 	}
+	if kind == "paragraph" {
+		if dst.Owner == author.Handle {
+			return nil, errForbidden
+		}
+		if pr.Original == "" || pr.Proposed == "" || pr.Rationale == "" {
+			return nil, errBadRequest
+		}
+		paras := splitParagraphs(dst.Body)
+		found := false
+		for i, p := range paras {
+			if p == pr.Original {
+				pr.ParagraphIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			if paragraphIndex < 0 || paragraphIndex >= len(paras) {
+				return nil, errBadRequest
+			}
+			return nil, errParagraphDrift
+		}
+		if title == "" {
+			title = "Change paragraph " + fmt.Sprint(pr.ParagraphIndex+1)
+		}
+		pr.Title = title
+		pr.Body = pr.Rationale
+		pr.SourcePostID = dst.ID
+		pr.SourceSHA = dst.HeadSHA
+		pr.TargetSHA = dst.HeadSHA
+	} else {
+		if src == nil {
+			return nil, errNotFound
+		}
+		if src.Owner != author.Handle {
+			return nil, errForbidden
+		}
+		if title == "" {
+			title = src.Subject
+		}
+		pr.Title = title
+		pr.Body = body
+		pr.SourcePostID = sourceID
+		pr.SourceSHA = src.HeadSHA
+		pr.TargetSHA = dst.HeadSHA
+	}
+	s.prSeq++
+	pr.Number = s.prSeq
 	s.prs[pr.ID] = pr
 	return pr, s.save()
 }
@@ -1084,8 +1224,7 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 		return nil, errNotFound
 	}
 	dst := s.posts[pr.TargetPostID]
-	src := s.posts[pr.SourcePostID]
-	if dst == nil || src == nil {
+	if dst == nil {
 		return nil, errNotFound
 	}
 	if dst.Owner != user.Handle {
@@ -1093,6 +1232,30 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 	}
 	if pr.Status != "open" {
 		return nil, errConflict
+	}
+	if pr.Kind == "paragraph" {
+		next, err := applyParagraph(dst.Body, pr.ParagraphIndex, pr.Original, pr.Proposed)
+		if err != nil {
+			return nil, err
+		}
+		dir := s.repoDir(dst.ID)
+		if err := writePostFile(dir, dst.Subject, next, dst.Story); err != nil {
+			return nil, err
+		}
+		sha, err := s.commit(dir, user.Name, user.Email, "Accept paragraph from @"+pr.Author+": "+pr.Title, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		pr.MergedSHA = sha
+		pr.Status = "merged"
+		pr.UpdatedAt = time.Now().UTC()
+		s.refreshPost(dst)
+		dst.UpdatedAt = pr.UpdatedAt
+		return pr, s.save()
+	}
+	src := s.posts[pr.SourcePostID]
+	if src == nil {
+		return nil, errNotFound
 	}
 	dir := s.repoDir(dst.ID)
 	remote := "pr-" + pr.ID
@@ -1135,7 +1298,7 @@ func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
 	return pr, s.save()
 }
 
-func (s *Store) ClosePR(id string, user *User) (*PullRequest, error) {
+func (s *Store) ClosePR(id string, user *User, note string) (*PullRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pr := s.prs[id]
@@ -1153,13 +1316,133 @@ func (s *Store) ClosePR(id string, user *User) (*PullRequest, error) {
 		return nil, errConflict
 	}
 	pr.Status = "closed"
+	pr.ReviewNote = strings.TrimSpace(note)
 	pr.UpdatedAt = time.Now().UTC()
 	return pr, s.save()
+}
+
+func (s *Store) CommentPR(id string, user *User, body string) (*PullRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pr := s.prs[id]
+	if pr == nil {
+		return nil, errNotFound
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil, errBadRequest
+	}
+	dst := s.posts[pr.TargetPostID]
+	if dst == nil {
+		return nil, errNotFound
+	}
+	if dst.Owner != user.Handle && pr.Author != user.Handle {
+		return nil, errForbidden
+	}
+	pr.Comments = append(pr.Comments, PRComment{
+		Author:    user.Handle,
+		Body:      body,
+		CreatedAt: time.Now().UTC(),
+	})
+	pr.UpdatedAt = time.Now().UTC()
+	return pr, s.save()
+}
+
+func (s *Store) ListForks(id string) []Post {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.posts[id] == nil {
+		return nil
+	}
+	out := []Post{}
+	for _, p := range s.posts {
+		if p.ParentPostID == id {
+			cp := *p
+			s.refreshPost(&cp)
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out
+}
+
+func (s *Store) Diverge(id, against string) (map[string]any, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fork := s.posts[id]
+	if fork == nil {
+		return nil, errNotFound
+	}
+	if fork.ParentPostID == "" {
+		return nil, errBadRequest
+	}
+	parent := s.posts[fork.ParentPostID]
+	if parent == nil {
+		return nil, errNotFound
+	}
+	if against == "" {
+		against = "parent"
+	}
+	var diff string
+	if against == "base" && fork.ForkedFromSHA != "" {
+		out, err := s.git(s.repoDir(fork.ID), "diff", fork.ForkedFromSHA, "HEAD", "--", "POST.md")
+		if err != nil {
+			// parent commit may not be in fork if history was rewritten
+			base, berr := s.readBlob(parent.ID, fork.ForkedFromSHA)
+			head, herr := s.readBlob(fork.ID, "")
+			if berr == nil && herr == nil {
+				diff = noIndexDiff(base, head)
+			}
+		} else {
+			diff = out
+		}
+	} else {
+		against = "parent"
+		parentRaw, _ := s.readBlob(parent.ID, "")
+		forkRaw, _ := s.readBlob(fork.ID, "")
+		diff = noIndexDiff(parentRaw, forkRaw)
+	}
+	return map[string]any{
+		"parentId":      parent.ID,
+		"parentSubject": parent.Subject,
+		"parentOwner":   parent.Owner,
+		"parentHeadSha": parent.HeadSHA,
+		"forkId":        fork.ID,
+		"forkSubject":   fork.Subject,
+		"forkOwner":     fork.Owner,
+		"forkHeadSha":   fork.HeadSHA,
+		"intent":        fork.ForkIntent,
+		"intentNote":    fork.ForkIntentNote,
+		"intentLabel":   forkIntentLabels[fork.ForkIntent],
+		"baseSha":       fork.ForkedFromSHA,
+		"against":       against,
+		"diff":          diff,
+	}, nil
+}
+
+func noIndexDiff(oldText, newText string) string {
+	a, err1 := os.CreateTemp("", "gp-old-*.md")
+	b, err2 := os.CreateTemp("", "gp-new-*.md")
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	defer os.Remove(a.Name())
+	defer os.Remove(b.Name())
+	_, _ = a.WriteString(oldText)
+	_, _ = b.WriteString(newText)
+	_ = a.Close()
+	_ = b.Close()
+	cmd := exec.Command("git", "diff", "--no-index", "--", a.Name(), b.Name())
+	out, _ := cmd.CombinedOutput()
+	return string(out)
 }
 
 func (s *Store) PRDiff(pr *PullRequest) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if pr.Kind == "paragraph" {
+		return noIndexDiff(pr.Original+"\n", pr.Proposed+"\n"), nil
+	}
 	src := filepath.Join(s.repoDir(pr.SourcePostID), "POST.md")
 	dst := filepath.Join(s.repoDir(pr.TargetPostID), "POST.md")
 	cmd := exec.Command("git", "diff", "--no-index", "--", dst, src)

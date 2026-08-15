@@ -69,6 +69,9 @@ func main() {
 	mux.HandleFunc("POST /api/posts/{id}/star", s.handleStar)
 	mux.HandleFunc("POST /api/posts/{id}/watch", s.handleWatch)
 	mux.HandleFunc("POST /api/posts/{id}/fork", s.handleFork)
+	mux.HandleFunc("GET /api/posts/{id}/forks", s.handleForks)
+	mux.HandleFunc("GET /api/posts/{id}/diverge", s.handleDiverge)
+	mux.HandleFunc("GET /api/posts/{id}/paragraphs", s.handleParagraphs)
 	mux.HandleFunc("GET /api/posts/{id}/branches", s.handleBranches)
 	mux.HandleFunc("POST /api/posts/{id}/branches", s.handleCreateBranch)
 	mux.HandleFunc("POST /api/posts/{id}/checkout", s.handleCheckout)
@@ -79,6 +82,7 @@ func main() {
 	mux.HandleFunc("GET /api/prs/{id}", s.handleGetPR)
 	mux.HandleFunc("POST /api/prs/{id}/merge", s.handleMergePR)
 	mux.HandleFunc("POST /api/prs/{id}/close", s.handleClosePR)
+	mux.HandleFunc("POST /api/prs/{id}/comment", s.handleCommentPR)
 
 	mux.HandleFunc("GET /api/users/{handle}", s.handleUser)
 	mux.HandleFunc("GET /api/story/preview", s.handleStoryPreview)

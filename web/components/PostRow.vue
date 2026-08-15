@@ -5,7 +5,7 @@
       <span>committed</span>
       <time :datetime="post.updatedAt" :title="formatFull(post.updatedAt)">{{ formatAgo(post.updatedAt) }}</time>
       <NuxtLink :to="`/p/${post.id}`" class="sha">{{ post.shortSha }}</NuxtLink>
-      <span v-if="post.parentPostId" class="pill">fork</span>
+      <span v-if="post.parentPostId" class="pill">{{ intentLabel(post.forkIntent) || "fork" }}</span>
       <span v-if="post.storyUrl" class="pill">story</span>
     </div>
     <h2 class="subject">
@@ -20,5 +20,6 @@
 </template>
 
 <script setup lang="ts">
+import { intentLabel } from "~/utils/intents";
 defineProps<{ post: any }>();
 </script>

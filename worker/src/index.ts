@@ -195,6 +195,8 @@ export class GitPostStore extends DurableObject<Env> {
         head_sha TEXT,
         parent_post_id TEXT,
         forked_from_sha TEXT,
+        fork_intent TEXT,
+        fork_intent_note TEXT,
         story_json TEXT,
         story_url TEXT,
         default_branch TEXT DEFAULT 'main',
@@ -241,6 +243,13 @@ export class GitPostStore extends DurableObject<Env> {
         target_sha TEXT,
         status TEXT,
         merged_sha TEXT,
+        kind TEXT DEFAULT 'full',
+        paragraph_index INTEGER DEFAULT 0,
+        original TEXT,
+        proposed TEXT,
+        rationale TEXT,
+        review_note TEXT,
+        comments_json TEXT,
         created_at TEXT,
         updated_at TEXT
       )`,
@@ -268,6 +277,23 @@ export class GitPostStore extends DurableObject<Env> {
     ];
     for (const stmt of statements) {
       this.ctx.storage.sql.exec(stmt);
+    }
+    for (const extra of [
+      "ALTER TABLE posts ADD COLUMN fork_intent TEXT",
+      "ALTER TABLE posts ADD COLUMN fork_intent_note TEXT",
+      "ALTER TABLE prs ADD COLUMN kind TEXT",
+      "ALTER TABLE prs ADD COLUMN paragraph_index INTEGER",
+      "ALTER TABLE prs ADD COLUMN original TEXT",
+      "ALTER TABLE prs ADD COLUMN proposed TEXT",
+      "ALTER TABLE prs ADD COLUMN rationale TEXT",
+      "ALTER TABLE prs ADD COLUMN review_note TEXT",
+      "ALTER TABLE prs ADD COLUMN comments_json TEXT",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(extra);
+      } catch {
+        /* already present */
+      }
     }
     const seeded = this.one<{ value: string }>("SELECT value FROM meta WHERE key = ?", "seed_version");
     if (!seeded || seeded.value !== SEED_VERSION) await this.seed();
@@ -404,6 +430,8 @@ export class GitPostStore extends DurableObject<Env> {
       body: p.body,
       parentPostId: p.parent_post_id || "",
       forkedFromSha: p.forked_from_sha || "",
+      forkIntent: p.fork_intent || "",
+      forkIntentNote: p.fork_intent_note || "",
       storyUrl: p.story_url || "",
       story,
       starCount: stars.length,
@@ -481,13 +509,15 @@ export class GitPostStore extends DurableObject<Env> {
     return this.findPost(p.id)!;
   }
 
-  private async forkPost(id: string, user: User) {
+  private async forkPost(id: string, user: User, intent: string, note: string) {
     const src = this.findPost(id);
     if (!src) throw new Error("not found");
+    intent = normalizeIntent(intent);
+    note = (note || "").trim().slice(0, 280);
     const nid = hex(5);
     const ts = new Date().toISOString();
     this.sql(
-      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, story_json, story_url, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, 'main', ?, ?)",
+      "INSERT INTO posts (id, owner, subject, slug, body, head_sha, parent_post_id, forked_from_sha, fork_intent, fork_intent_note, story_json, story_url, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'main', ?, ?)",
       nid,
       user.handle,
       src.subject,
@@ -495,6 +525,8 @@ export class GitPostStore extends DurableObject<Env> {
       src.body,
       src.id,
       src.head_sha,
+      intent,
+      note,
       src.story_json,
       src.story_url,
       ts,
@@ -518,30 +550,71 @@ export class GitPostStore extends DurableObject<Env> {
       );
       last = sha;
     }
-    const forkSha = await this.commit(nid, user, "fork: " + src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null, ts, last);
+    const forkSha = await this.commit(nid, user, "fork(" + intent + "): " + src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null, ts, last);
     this.sql("UPDATE posts SET head_sha = ? WHERE id = ?", forkSha, nid);
     return this.findPost(nid)!;
   }
 
-  private async openPR(user: User, title: string, body: string, sourceId: string, targetId: string) {
-    const src = this.findPost(sourceId);
+  private async openPR(
+    user: User,
+    title: string,
+    body: string,
+    sourceId: string,
+    targetId: string,
+    kind: string,
+    paragraphIndex: number,
+    original: string,
+    proposed: string,
+    rationale: string,
+  ) {
     const dst = this.findPost(targetId);
-    if (!src || !dst) throw new Error("not found");
-    if (src.owner !== user.handle) throw new Error("forbidden");
+    if (!dst) throw new Error("not found");
+    kind = (kind || "full").toLowerCase();
+    if (kind !== "full" && kind !== "paragraph") throw new Error("bad request");
     const n = (this.one<{ n: number }>("SELECT COALESCE(MAX(number),0) as n FROM prs")?.n || 0) + 1;
     const id = hex(4);
     const ts = new Date().toISOString();
+    original = (original || "").trim();
+    proposed = (proposed || "").trim();
+    rationale = (rationale || "").trim();
+    let sourceSha = "";
+    let targetSha = dst.head_sha;
+    let sourcePostId = sourceId;
+    if (kind === "paragraph") {
+      if (dst.owner === user.handle) throw new Error("forbidden");
+      if (!original || !proposed || !rationale) throw new Error("bad request");
+      const paras = splitParagraphs(dst.body || "");
+      const found = paras.findIndex((p) => p === original);
+      if (found < 0) throw new Error("that paragraph has changed since this proposal");
+      paragraphIndex = found;
+      if (!title) title = "Change paragraph " + (found + 1);
+      body = rationale;
+      sourcePostId = dst.id;
+      sourceSha = dst.head_sha;
+    } else {
+      const src = this.findPost(sourceId);
+      if (!src) throw new Error("not found");
+      if (src.owner !== user.handle) throw new Error("forbidden");
+      if (!title) title = src.subject;
+      sourceSha = src.head_sha;
+      sourcePostId = src.id;
+    }
     this.sql(
-      "INSERT INTO prs (id, number, title, body, author, target_post_id, source_post_id, source_sha, target_sha, status, merged_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?)",
+      "INSERT INTO prs (id, number, title, body, author, target_post_id, source_post_id, source_sha, target_sha, status, merged_sha, kind, paragraph_index, original, proposed, rationale, review_note, comments_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?, ?, ?, ?, '', '[]', ?, ?)",
       id,
       n,
-      title || src.subject,
+      title,
       body || "",
       user.handle,
       dst.id,
-      src.id,
-      src.head_sha,
-      dst.head_sha,
+      sourcePostId,
+      sourceSha,
+      targetSha,
+      kind,
+      paragraphIndex || 0,
+      original,
+      proposed,
+      rationale,
       ts,
       ts,
     );
@@ -914,8 +987,63 @@ export class GitPostStore extends DurableObject<Env> {
 
         if (rest === "fork" && method === "POST") {
           if (!viewer) return err(401, "unauthorized");
-          const np = await this.forkPost(p.id, viewer);
+          let inb: any = {};
+          try {
+            inb = await req.json<any>();
+          } catch {
+            inb = {};
+          }
+          const np = await this.forkPost(p.id, viewer, inb.intent || "", inb.note || "");
           return json({ post: this.postPayload(np, viewer) }, 201);
+        }
+
+        if (rest === "forks" && method === "GET") {
+          const forks = this.sql<any>("SELECT * FROM posts WHERE parent_post_id = ? ORDER BY updated_at DESC", p.id).map((row) => {
+            const item = this.postPayload(row, viewer);
+            delete (item as any).body;
+            return item;
+          });
+          return json({ forks });
+        }
+
+        if (rest === "diverge" && method === "GET") {
+          if (!p.parent_post_id) return err(400, "bad request");
+          const parent = this.findPost(p.parent_post_id);
+          if (!parent) return err(404, "not found");
+          let against = url.searchParams.get("against") || "parent";
+          let oldT = "";
+          let newT = encodePostFile(p.subject, p.body, p.story_json ? JSON.parse(p.story_json) : null);
+          if (against === "base" && p.forked_from_sha) {
+            const base = this.one<any>("SELECT * FROM commits WHERE sha = ?", p.forked_from_sha);
+            oldT = base
+              ? encodePostFile(base.subject, base.body, base.story_json ? JSON.parse(base.story_json) : null)
+              : encodePostFile(parent.subject, parent.body, parent.story_json ? JSON.parse(parent.story_json) : null);
+          } else {
+            against = "parent";
+            oldT = encodePostFile(parent.subject, parent.body, parent.story_json ? JSON.parse(parent.story_json) : null);
+          }
+          return json({
+            parentId: parent.id,
+            parentSubject: parent.subject,
+            parentOwner: parent.owner,
+            parentHeadSha: parent.head_sha,
+            forkId: p.id,
+            forkSubject: p.subject,
+            forkOwner: p.owner,
+            forkHeadSha: p.head_sha,
+            intent: p.fork_intent || "",
+            intentNote: p.fork_intent_note || "",
+            intentLabel: FORK_INTENT_LABELS[p.fork_intent] || p.fork_intent || "",
+            baseSha: p.forked_from_sha || "",
+            against,
+            diff: unifiedDiff(oldT, newT),
+          });
+        }
+
+        if (rest === "paragraphs" && method === "GET") {
+          return json({
+            paragraphs: splitParagraphs(p.body || "").map((text, index) => ({ index, text })),
+          });
         }
 
         if (rest === "branches" && method === "GET") {
@@ -979,28 +1107,25 @@ export class GitPostStore extends DurableObject<Env> {
         let prs = this.sql<any>("SELECT * FROM prs ORDER BY number DESC");
         if (postId) prs = prs.filter((pr) => pr.target_post_id === postId || pr.source_post_id === postId);
         return json({
-          prs: prs.map((pr) => ({
-            id: pr.id,
-            number: pr.number,
-            title: pr.title,
-            body: pr.body,
-            author: pr.author,
-            targetPostId: pr.target_post_id,
-            sourcePostId: pr.source_post_id,
-            sourceSha: pr.source_sha,
-            targetSha: pr.target_sha,
-            status: pr.status,
-            mergedSha: pr.merged_sha,
-            createdAt: pr.created_at,
-            updatedAt: pr.updated_at,
-          })),
+          prs: prs.map((pr) => mapPR(pr)),
         });
       }
 
       if (path === "/api/prs" && method === "POST") {
         if (!viewer) return err(401, "unauthorized");
         const inb = await req.json<any>();
-        const pr = await this.openPR(viewer, inb.title, inb.body, inb.sourceId, inb.targetId);
+        const pr = await this.openPR(
+          viewer,
+          inb.title,
+          inb.body,
+          inb.sourceId,
+          inb.targetId,
+          inb.kind,
+          Number(inb.paragraphIndex) || 0,
+          inb.original || "",
+          inb.proposed || "",
+          inb.rationale || "",
+        );
         return json({ pr: mapPR(pr) }, 201);
       }
 
@@ -1016,18 +1141,46 @@ export class GitPostStore extends DurableObject<Env> {
         if (!rest && method === "GET") {
           const src = this.findPost(pr.source_post_id);
           const dst = this.findPost(pr.target_post_id);
-          const oldT = dst ? encodePostFile(dst.subject, dst.body, dst.story_json ? JSON.parse(dst.story_json) : null) : "";
-          const newT = src ? encodePostFile(src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null) : "";
-          return json({ pr: mapPR(pr), diff: unifiedDiff(oldT, newT), source: src, target: dst });
+          let diff = "";
+          if (pr.kind === "paragraph") {
+            diff = unifiedDiff((pr.original || "") + "\n", (pr.proposed || "") + "\n");
+          } else {
+            const oldT = dst ? encodePostFile(dst.subject, dst.body, dst.story_json ? JSON.parse(dst.story_json) : null) : "";
+            const newT = src ? encodePostFile(src.subject, src.body, src.story_json ? JSON.parse(src.story_json) : null) : "";
+            diff = unifiedDiff(oldT, newT);
+          }
+          return json({ pr: mapPR(pr), diff, source: src, target: dst });
         }
 
         if (rest === "merge" && method === "POST") {
           if (!viewer) return err(401, "unauthorized");
           const dst = this.findPost(pr.target_post_id);
-          const src = this.findPost(pr.source_post_id);
-          if (!dst || !src) return err(404, "not found");
+          if (!dst) return err(404, "not found");
           if (dst.owner !== viewer.handle) return err(403, "forbidden");
           if (pr.status !== "open") return err(409, "conflict");
+          if (pr.kind === "paragraph") {
+            let next: string;
+            try {
+              next = applyParagraph(dst.body || "", Number(pr.paragraph_index) || 0, pr.original || "", pr.proposed || "");
+            } catch (e: any) {
+              const msg = String(e?.message || e);
+              if (msg.includes("changed")) return err(409, msg);
+              return err(400, msg);
+            }
+            const sha = await this.commit(
+              dst.id,
+              viewer,
+              `Accept paragraph from @${pr.author}: ${pr.title}`,
+              next,
+              dst.story_json ? JSON.parse(dst.story_json) : null,
+              new Date().toISOString(),
+              dst.head_sha,
+            );
+            this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
+            return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+          }
+          const src = this.findPost(pr.source_post_id);
+          if (!src) return err(404, "not found");
           const sha = await this.commit(dst.id, viewer, `Merge PR #${pr.number}: ${pr.title}`, src.body, src.story_json ? JSON.parse(src.story_json) : null, new Date().toISOString(), dst.head_sha);
           this.sql("UPDATE prs SET status = 'merged', merged_sha = ?, updated_at = ? WHERE id = ?", sha, new Date().toISOString(), pr.id);
           return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
@@ -1039,7 +1192,37 @@ export class GitPostStore extends DurableObject<Env> {
           if (!dst) return err(404, "not found");
           if (dst.owner !== viewer.handle && pr.author !== viewer.handle) return err(403, "forbidden");
           if (pr.status !== "open") return err(409, "conflict");
-          this.sql("UPDATE prs SET status = 'closed', updated_at = ? WHERE id = ?", new Date().toISOString(), pr.id);
+          let inb: any = {};
+          try {
+            inb = await req.json<any>();
+          } catch {
+            inb = {};
+          }
+          this.sql(
+            "UPDATE prs SET status = 'closed', review_note = ?, updated_at = ? WHERE id = ?",
+            inb.note || "",
+            new Date().toISOString(),
+            pr.id,
+          );
+          return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
+        }
+
+        if (rest === "comment" && method === "POST") {
+          if (!viewer) return err(401, "unauthorized");
+          const dst = this.findPost(pr.target_post_id);
+          if (!dst) return err(404, "not found");
+          if (dst.owner !== viewer.handle && pr.author !== viewer.handle) return err(403, "forbidden");
+          const inb = await req.json<any>();
+          const text = String(inb.body || "").trim();
+          if (!text) return err(400, "bad request");
+          let comments: any[] = [];
+          try {
+            comments = JSON.parse(pr.comments_json || "[]");
+          } catch {
+            comments = [];
+          }
+          comments.push({ author: viewer.handle, body: text, createdAt: new Date().toISOString() });
+          this.sql("UPDATE prs SET comments_json = ?, updated_at = ? WHERE id = ?", JSON.stringify(comments), new Date().toISOString(), pr.id);
           return json({ pr: mapPR(this.one<any>("SELECT * FROM prs WHERE id = ?", pr.id)) });
         }
       }
@@ -1073,7 +1256,7 @@ export class GitPostStore extends DurableObject<Env> {
       if (msg === "not found") return err(404, msg);
       if (msg === "unauthorized") return err(401, msg);
       if (msg === "forbidden") return err(403, msg);
-      if (msg === "conflict") return err(409, msg);
+      if (msg === "that paragraph has changed since this proposal") return err(409, msg);
       if (msg === "bad request") return err(400, msg);
       return err(500, msg);
     }
@@ -1081,6 +1264,12 @@ export class GitPostStore extends DurableObject<Env> {
 }
 
 function mapPR(pr: any) {
+  let comments: any[] = [];
+  try {
+    comments = JSON.parse(pr.comments_json || "[]");
+  } catch {
+    comments = [];
+  }
   return {
     id: pr.id,
     number: pr.number,
@@ -1093,9 +1282,54 @@ function mapPR(pr: any) {
     targetSha: pr.target_sha,
     status: pr.status,
     mergedSha: pr.merged_sha,
+    kind: pr.kind || "full",
+    paragraphIndex: pr.paragraph_index || 0,
+    original: pr.original || "",
+    proposed: pr.proposed || "",
+    rationale: pr.rationale || "",
+    reviewNote: pr.review_note || "",
+    comments,
     createdAt: pr.created_at,
     updatedAt: pr.updated_at,
   };
+}
+
+const FORK_INTENT_LABELS: Record<string, string> = {
+  "counter-argument": "Counter-argument",
+  extension: "Extension",
+  translation: "Translation",
+  simplification: "Simplification",
+  implementation: "Implementation",
+};
+
+function normalizeIntent(s: string): string {
+  s = (s || "").toLowerCase().trim().replace(/[\s_]+/g, "-");
+  if (s === "counterargument") s = "counter-argument";
+  if (!FORK_INTENT_LABELS[s]) throw new Error("bad request");
+  return s;
+}
+
+function splitParagraphs(body: string): string[] {
+  return (body || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .split(/\n\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+function applyParagraph(body: string, index: number, original: string, proposed: string): string {
+  original = (original || "").trim();
+  proposed = (proposed || "").trim();
+  if (!proposed) throw new Error("bad request");
+  const paras = splitParagraphs(body);
+  const found = paras.findIndex((p) => p === original);
+  if (found >= 0) {
+    paras[found] = proposed;
+    return paras.join("\n\n");
+  }
+  if (index >= 0 && index < paras.length) throw new Error("that paragraph has changed since this proposal");
+  throw new Error("not found");
 }
 
 async function fetchStory(rawURL: string) {

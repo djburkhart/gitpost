@@ -17,6 +17,12 @@ export function friendlyError(raw: string): { title: string; detail?: string } {
       detail: "That commit is already applied here — nothing new to cherry-pick.",
     };
   }
+  if (lower.includes("paragraph has changed")) {
+    return {
+      title: "Paragraph moved on",
+      detail: "That paragraph has changed since this proposal. Re-read the current text and open a new take.",
+    };
+  }
   if (lower.includes("conflict")) {
     return {
       title: "Couldn’t apply cleanly",

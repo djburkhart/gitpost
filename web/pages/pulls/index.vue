@@ -6,6 +6,7 @@
       <li v-for="pr in prs" :key="pr.id" class="log-item">
         <div class="log-meta">
           <span class="pill">{{ pr.status }}</span>
+          <span v-if="pr.kind === 'paragraph'" class="pill">paragraph</span>
           <NuxtLink :to="`/u/${pr.author}`">{{ pr.author }}</NuxtLink>
           <time>{{ formatAgo(pr.createdAt) }}</time>
         </div>

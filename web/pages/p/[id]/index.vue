@@ -7,12 +7,15 @@
       ·
       {{ post.defaultBranch }}
       <span v-if="post.parentPostId">
-        · forked from
+        ·
+        <span class="pill">{{ intentLabel(post.forkIntent) || "fork" }}</span>
+        of
         <NuxtLink :to="`/p/${post.parentPostId}`">{{ post.parentPostId.slice(0, 8) }}</NuxtLink>
       </span>
     </p>
     <header class="post-head">
       <h1 class="subject">{{ post.subject }}</h1>
+      <p v-if="post.forkIntentNote" class="muted" style="margin-top: -8px">{{ post.forkIntentNote }}</p>
       <div class="log-meta">
         <time :datetime="post.updatedAt">{{ formatFull(post.updatedAt) }}</time>
         <span>{{ post.commitCount }} {{ post.commitCount === 1 ? "commit" : "commits" }}</span>
@@ -28,22 +31,35 @@
       <button class="btn btn-sm" :class="{ 'btn-primary': post.watched }" @click="act('watch')">
         Watch
       </button>
-      <button class="btn btn-sm" @click="fork">Fork</button>
+      <button class="btn btn-sm" @click="startFork">Fork</button>
       <NuxtLink v-if="mine" :to="`/p/${post.id}/edit`" class="btn btn-sm">Amend</NuxtLink>
       <button v-if="canPR" class="btn btn-sm" @click="openPR">Open pull request</button>
+      <button v-if="canPropose" class="btn btn-sm" :class="{ 'btn-primary': proposeMode }" type="button" @click="togglePropose">
+        {{ proposeMode ? "Done proposing" : "Propose a change" }}
+      </button>
       <button v-if="mine && cherrySha" class="btn btn-sm" @click="doCherry">Cherry-pick {{ cherrySha.slice(0, 7) }}</button>
       <button v-if="user?.isAdmin" class="btn btn-sm btn-danger" type="button" @click="adminDelete">Remove post</button>
     </div>
 
     <div class="tabs" role="tablist">
-      <button v-for="t in tabs" :key="t.id" role="tab" :aria-selected="tab === t.id" @click="tab = t.id">
+      <button v-for="t in visibleTabs" :key="t.id" role="tab" :aria-selected="tab === t.id" @click="tab = t.id">
         {{ t.label }}
       </button>
     </div>
 
     <section v-if="tab === 'read'">
-      <MarkdownBody :source="post.body" />
-      <StoryEmbed v-if="post.story" :story="post.story" />
+      <template v-if="proposeMode">
+        <p class="muted" style="margin-top: 0">Pick the paragraph you disagree with.</p>
+        <article v-for="para in paragraphs" :key="para.index" class="para-block">
+          <MarkdownBody :source="para.text" />
+          <button class="btn btn-sm" type="button" @click="proposePara(para)">Disagree</button>
+        </article>
+        <p v-if="!paragraphs.length" class="empty">No paragraphs to propose against yet.</p>
+      </template>
+      <template v-else>
+        <MarkdownBody :source="post.body" />
+        <StoryEmbed v-if="post.story" :story="post.story" />
+      </template>
     </section>
 
     <section v-else-if="tab === 'history'">
@@ -86,6 +102,42 @@
       <DiffView :diff="diff" :empty-label="diffEmpty" />
     </section>
 
+    <section v-else-if="tab === 'diverge'">
+      <div class="diverge-head">
+        <div>
+          <p class="kicker">{{ diverge?.intentLabel || intentLabel(post.forkIntent) || "fork" }}</p>
+          <p class="muted" style="margin: 0 0 12px">
+            Compared with
+            <NuxtLink v-if="diverge" :to="`/p/${diverge.parentId}`">{{ diverge.parentSubject }}</NuxtLink>
+          </p>
+        </div>
+        <div class="seg">
+          <button type="button" :class="{ active: against === 'parent' }" @click="setAgainst('parent')">parent now</button>
+          <button type="button" :class="{ active: against === 'base' }" @click="setAgainst('base')">at fork</button>
+        </div>
+      </div>
+      <p v-if="diverge?.intentNote" class="muted">{{ diverge.intentNote }}</p>
+      <DiffView :diff="diverge?.diff || ''" empty-label="This take still matches the parent." />
+    </section>
+
+    <section v-else-if="tab === 'takes'">
+      <p class="muted" style="margin-top: 0">Other branches of this idea. Each fork carries an intent.</p>
+      <ul class="log-list">
+        <li v-for="f in forks" :key="f.id" class="log-item">
+          <div class="log-meta">
+            <NuxtLink :to="`/u/${f.owner}`">{{ f.owner }}</NuxtLink>
+            <span class="pill">{{ intentLabel(f.forkIntent) || "fork" }}</span>
+            <NuxtLink :to="`/p/${f.id}`" class="sha">{{ f.shortSha }}</NuxtLink>
+          </div>
+          <h2 class="subject">
+            <NuxtLink :to="`/p/${f.id}`">{{ f.subject }}</NuxtLink>
+          </h2>
+          <p v-if="f.forkIntentNote" class="muted" style="margin: 0">{{ f.forkIntentNote }}</p>
+        </li>
+      </ul>
+      <p v-if="!forks.length" class="empty">No takes yet. Fork this object to start one.</p>
+    </section>
+
     <section v-else-if="tab === 'branches'">
       <form v-if="mine" class="row" style="margin-bottom: 16px" @submit.prevent="createBranch">
         <input v-model="newBranch" placeholder="alternative-take" class="btn" style="flex: 1; text-align: left" />
@@ -111,6 +163,7 @@
             <div class="log-meta">
               <span>{{ pr.author }}</span>
               <span>{{ pr.status }}</span>
+              <span v-if="pr.kind === 'paragraph'" class="pill">paragraph</span>
             </div>
           </div>
           <span class="pill">{{ pr.status }}</span>
@@ -118,6 +171,16 @@
       </ul>
       <p v-if="!prs.length" class="empty">No pull requests on this object.</p>
     </section>
+
+    <ForkSheet v-if="showFork" :post-id="post.id" @close="showFork = false" @forked="onForked" />
+    <ParagraphPropose
+      v-if="proposal"
+      :post-id="post.id"
+      :index="proposal.index"
+      :original="proposal.text"
+      @close="proposal = null"
+      @opened="onProposed"
+    />
   </main>
   <main v-else class="page">
     <p class="empty">{{ loading ? "Resolving object…" : "Object not found." }}</p>
@@ -125,6 +188,8 @@
 </template>
 
 <script setup lang="ts">
+import { intentLabel } from "~/utils/intents";
+
 const route = useRoute();
 const { user, ready, refresh } = useAuth();
 const post = ref<any>(null);
@@ -134,12 +199,18 @@ const tabs = [
   { id: "read", label: "Read" },
   { id: "history", label: "History" },
   { id: "diff", label: "Diff" },
+  { id: "diverge", label: "Diverge" },
+  { id: "takes", label: "Takes" },
   { id: "branches", label: "Branches" },
   { id: "pulls", label: "Pulls" },
 ];
 const commits = ref<any[]>([]);
 const branches = ref<any[]>([]);
 const prs = ref<any[]>([]);
+const forks = ref<any[]>([]);
+const paragraphs = ref<{ index: number; text: string }[]>([]);
+const diverge = ref<any>(null);
+const against = ref<"parent" | "base">("parent");
 const diff = ref("");
 const fromSha = ref("");
 const toSha = ref("");
@@ -147,9 +218,14 @@ const blob = ref<any>(null);
 const selectedSha = ref("");
 const cherrySha = ref("");
 const newBranch = ref("");
-const notice = ref("");
-const error = ref("");
 const flash = useFlash();
+const showFork = ref(false);
+const proposeMode = ref(false);
+const proposal = ref<{ index: number; text: string } | null>(null);
+
+const visibleTabs = computed(() =>
+  tabs.filter((t) => (t.id === "diverge" ? !!post.value?.parentPostId : true)),
+);
 
 const diffEmpty = computed(() => {
   if (commits.value.length < 2) return "This object has only one commit — nothing to compare yet.";
@@ -161,22 +237,24 @@ const diffEmpty = computed(() => {
 
 const mine = computed(() => user.value && post.value && user.value.handle === post.value.owner);
 const canPR = computed(() => user.value && post.value && post.value.parentPostId && mine.value);
+const canPropose = computed(() => user.value && post.value && !mine.value);
 
 async function load() {
   loading.value = true;
-  error.value = "";
   try {
     const data = await api<{ post: any }>(`/api/posts/${route.params.id}`);
     post.value = data.post;
     try {
-      const [h, b, p] = await Promise.all([
+      const [h, b, p, f] = await Promise.all([
         api<{ commits: any[] }>(`/api/posts/${data.post.id}/history`),
         api<{ branches: any[] }>(`/api/posts/${data.post.id}/branches`),
         api<{ prs: any[] }>(`/api/prs?post=${data.post.id}`),
+        api<{ forks: any[] }>(`/api/posts/${data.post.id}/forks`),
       ]);
       commits.value = h.commits || [];
       branches.value = b.branches || [];
       prs.value = p.prs || [];
+      forks.value = f.forks || [];
       if (commits.value.length >= 2) {
         toSha.value = commits.value[0].sha;
         fromSha.value = commits.value[commits.value.length - 1].sha;
@@ -185,6 +263,7 @@ async function load() {
         toSha.value = commits.value[0].sha;
         fromSha.value = commits.value[0].sha;
       }
+      if (data.post.parentPostId) await loadDiverge();
     } catch (e: any) {
       flash.error(e);
     }
@@ -206,6 +285,16 @@ async function loadDiff() {
   diff.value = data.diff || "";
 }
 
+async function loadDiverge() {
+  if (!post.value?.parentPostId) return;
+  diverge.value = await api(`/api/posts/${post.value.id}/diverge?against=${against.value}`);
+}
+
+async function setAgainst(next: "parent" | "base") {
+  against.value = next;
+  await loadDiverge();
+}
+
 async function selectCommit(sha: string) {
   selectedSha.value = sha;
   const data = await api(`/api/posts/${post.value.id}/blob?sha=${sha}`);
@@ -218,19 +307,37 @@ async function act(kind: "star" | "watch") {
   post.value = data.post;
 }
 
-async function fork() {
+function startFork() {
   if (!user.value) return navigateTo(`/login?next=/p/${route.params.id}`);
-  error.value = "";
-  try {
-    const data = await api<{ post: any }>(`/api/posts/${post.value.id}/fork`, { method: "POST" });
-    await navigateTo(`/p/${data.post.id}`);
-  } catch (e: any) {
-    flash.error(e);
+  showFork.value = true;
+}
+
+function onForked(id: string) {
+  showFork.value = false;
+  navigateTo(`/p/${id}/edit`);
+}
+
+async function togglePropose() {
+  if (!user.value) return navigateTo(`/login?next=/p/${route.params.id}`);
+  proposeMode.value = !proposeMode.value;
+  tab.value = "read";
+  if (proposeMode.value && !paragraphs.value.length) {
+    const data = await api<{ paragraphs: { index: number; text: string }[] }>(`/api/posts/${post.value.id}/paragraphs`);
+    paragraphs.value = data.paragraphs || [];
   }
 }
 
+function proposePara(para: { index: number; text: string }) {
+  proposal.value = para;
+}
+
+function onProposed(id: string) {
+  proposal.value = null;
+  proposeMode.value = false;
+  navigateTo(`/pulls/${id}`);
+}
+
 async function openPR() {
-  error.value = "";
   try {
     const data = await api<{ pr: any }>("/api/prs", {
       method: "POST",
@@ -238,7 +345,7 @@ async function openPR() {
         sourceId: post.value.id,
         targetId: post.value.parentPostId,
         title: post.value.subject,
-        body: "Proposed improvement from my fork.",
+        body: post.value.forkIntentNote || `Proposed ${intentLabel(post.value.forkIntent) || "improvement"} from my fork.`,
       }),
     });
     await navigateTo(`/pulls/${data.pr.id}`);
@@ -248,7 +355,6 @@ async function openPR() {
 }
 
 async function createBranch() {
-  error.value = "";
   try {
     await api(`/api/posts/${post.value.id}/branches`, {
       method: "POST",
@@ -272,7 +378,6 @@ async function checkout(name: string) {
 }
 
 async function doCherry() {
-  error.value = "";
   try {
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}/cherry-pick`, {
       method: "POST",
@@ -289,7 +394,6 @@ async function doCherry() {
 
 async function adminDelete() {
   if (!confirm("Permanently remove this post?")) return;
-  error.value = "";
   try {
     await api(`/api/admin/posts/${post.value.id}`, { method: "DELETE" });
     await navigateTo("/");
@@ -304,4 +408,7 @@ onMounted(async () => {
 });
 
 watch(() => route.params.id, () => load());
+watch(tab, async (id) => {
+  if (id === "diverge" && !diverge.value) await loadDiverge();
+});
 </script>

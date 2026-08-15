@@ -47,6 +47,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 409, map[string]string{"error": "cherry-pick conflicted with the current tip"})
 	case errors.Is(err, errGitFailed):
 		writeJSON(w, 400, map[string]string{"error": "that git action failed"})
+	case errors.Is(err, errParagraphDrift):
+		writeJSON(w, 409, map[string]string{"error": "that paragraph has changed since this proposal"})
 	default:
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 	}
@@ -192,8 +194,10 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"subject":       p.Subject,
 		"slug":          p.Slug,
 		"body":          p.Body,
-		"parentPostId":  p.ParentPostID,
-		"forkedFromSha": p.ForkedFromSHA,
+		"parentPostId":   p.ParentPostID,
+		"forkedFromSha":  p.ForkedFromSHA,
+		"forkIntent":     p.ForkIntent,
+		"forkIntentNote": p.ForkIntentNote,
 		"storyUrl":      p.StoryURL,
 		"story":         p.Story,
 		"starCount":     len(p.Stars),
@@ -395,12 +399,62 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errNotFound)
 		return
 	}
-	np, err := s.store.Fork(p.ID, u)
+	var in struct {
+		Intent string `json:"intent"`
+		Note   string `json:"note"`
+	}
+	_ = readJSON(r, &in)
+	np, err := s.store.Fork(p.ID, u, in.Intent, in.Note)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"post": postPayload(np, u)})
+}
+
+func (s *Server) handleForks(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	list := s.store.ListForks(p.ID)
+	viewer := s.currentUser(r)
+	out := make([]map[string]any, 0, len(list))
+	for i := range list {
+		item := postPayload(&list[i], viewer)
+		delete(item, "body")
+		out = append(out, item)
+	}
+	writeJSON(w, 200, map[string]any{"forks": out})
+}
+
+func (s *Server) handleDiverge(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	data, err := s.store.Diverge(p.ID, r.URL.Query().Get("against"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, data)
+}
+
+func (s *Server) handleParagraphs(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	paras := splitParagraphs(p.Body)
+	out := make([]map[string]any, 0, len(paras))
+	for i, t := range paras {
+		out = append(out, map[string]any{"index": i, "text": t})
+	}
+	writeJSON(w, 200, map[string]any{"paragraphs": out})
 }
 
 func (s *Server) handleBranches(w http.ResponseWriter, r *http.Request) {
@@ -508,16 +562,25 @@ func (s *Server) handleCreatePR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Title    string `json:"title"`
-		Body     string `json:"body"`
-		SourceID string `json:"sourceId"`
-		TargetID string `json:"targetId"`
+		Title          string `json:"title"`
+		Body           string `json:"body"`
+		SourceID       string `json:"sourceId"`
+		TargetID       string `json:"targetId"`
+		Kind           string `json:"kind"`
+		ParagraphIndex int    `json:"paragraphIndex"`
+		Original       string `json:"original"`
+		Proposed       string `json:"proposed"`
+		Rationale      string `json:"rationale"`
 	}
-	if err := readJSON(r, &in); err != nil || in.SourceID == "" || in.TargetID == "" {
+	if err := readJSON(r, &in); err != nil || in.TargetID == "" {
 		writeErr(w, errBadRequest)
 		return
 	}
-	pr, err := s.store.OpenPR(u, in.Title, in.Body, in.SourceID, in.TargetID)
+	if in.Kind != "paragraph" && in.SourceID == "" {
+		writeErr(w, errBadRequest)
+		return
+	}
+	pr, err := s.store.OpenPR(u, in.Title, in.Body, in.SourceID, in.TargetID, in.Kind, in.ParagraphIndex, in.Original, in.Proposed, in.Rationale)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -570,7 +633,36 @@ func (s *Server) handleClosePR(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errNotFound)
 		return
 	}
-	np, err := s.store.ClosePR(pr.ID, u)
+	var in struct {
+		Note string `json:"note"`
+	}
+	_ = readJSON(r, &in)
+	np, err := s.store.ClosePR(pr.ID, u, in.Note)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"pr": np})
+}
+
+func (s *Server) handleCommentPR(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	pr := s.store.GetPR(r.PathValue("id"))
+	if pr == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	var in struct {
+		Body string `json:"body"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	np, err := s.store.CommentPR(pr.ID, u, in.Body)
 	if err != nil {
 		writeErr(w, err)
 		return
