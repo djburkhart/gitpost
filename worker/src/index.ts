@@ -944,6 +944,9 @@ export class GitPostStore extends DurableObject<Env> {
           let c = this.one<any>("SELECT * FROM commits WHERE sha = ?", inb.sha);
           if (!c && inb.sourceId) c = this.one<any>("SELECT * FROM commits WHERE sha = ? AND post_id = ?", inb.sha, inb.sourceId);
           if (!c) return err(404, "not found");
+          if (c.sha === p.head_sha || (c.subject === p.subject && c.body === p.body)) {
+            return err(409, "that commit is already in this history");
+          }
           const np = await this.amendPost(p.id, viewer, c.subject, c.body, c.story_json ? JSON.parse(c.story_json) : null);
           return json({ post: this.postPayload(np, viewer) });
         }

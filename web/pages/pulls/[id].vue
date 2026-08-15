@@ -17,7 +17,6 @@
       <button v-if="canClose" class="btn" type="button" @click="closePR">Close</button>
     </div>
     <p v-if="pr.mergedSha" class="subtle">Merged as <span class="sha">{{ pr.mergedSha.slice(0, 7) }}</span></p>
-    <p v-if="error" style="color: var(--del)">{{ error }}</p>
   </main>
 </template>
 
@@ -28,6 +27,7 @@ const pr = ref<any>(null);
 const target = ref<any>(null);
 const diff = ref("");
 const error = ref("");
+const flash = useFlash();
 
 const canMerge = computed(() => user.value && target.value && user.value.handle === target.value.owner);
 const canClose = computed(
@@ -47,7 +47,7 @@ async function merge() {
     const data = await api<{ pr: any }>(`/api/prs/${pr.value.id}/merge`, { method: "POST" });
     pr.value = data.pr;
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 
@@ -57,7 +57,7 @@ async function closePR() {
     const data = await api<{ pr: any }>(`/api/prs/${pr.value.id}/close`, { method: "POST" });
     pr.value = data.pr;
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 

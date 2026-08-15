@@ -41,6 +41,12 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 403, map[string]string{"error": "registration is closed"})
 	case errors.Is(err, errLastSuper):
 		writeJSON(w, 403, map[string]string{"error": "cannot modify the super admin"})
+	case errors.Is(err, errAlreadyApplied):
+		writeJSON(w, 409, map[string]string{"error": "that commit is already in this history"})
+	case errors.Is(err, errCherryConflict):
+		writeJSON(w, 409, map[string]string{"error": "cherry-pick conflicted with the current tip"})
+	case errors.Is(err, errGitFailed):
+		writeJSON(w, 400, map[string]string{"error": "that git action failed"})
 	default:
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 	}

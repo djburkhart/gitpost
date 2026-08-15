@@ -16,7 +16,6 @@
         <button v-for="t in tabs" :key="t.id" :aria-selected="tab === t.id" @click="tab = t.id">{{ t.label }}</button>
       </div>
       <p v-if="notice" class="subtle">{{ notice }}</p>
-      <p v-if="error" style="color: var(--del)">{{ error }}</p>
 
       <section v-if="tab === 'users'">
         <div class="table-wrap">
@@ -150,6 +149,7 @@ const sessions = ref<any[]>([]);
 const audit = ref<any[]>([]);
 const settings = ref({ signupMode: "invite", minPassword: 12 });
 const error = ref("");
+const flash = useFlash();
 const notice = ref("");
 
 onMounted(async () => {
@@ -176,7 +176,7 @@ async function load() {
     audit.value = ev.events || [];
     settings.value = st.settings || settings.value;
   } catch (e: any) {
-    error.value = e.message || "Could not load admin data";
+    flash.error(e);
   }
 }
 

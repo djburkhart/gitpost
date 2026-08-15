@@ -34,8 +34,6 @@
       <button v-if="mine && cherrySha" class="btn btn-sm" @click="doCherry">Cherry-pick {{ cherrySha.slice(0, 7) }}</button>
       <button v-if="user?.isAdmin" class="btn btn-sm btn-danger" type="button" @click="adminDelete">Remove post</button>
     </div>
-    <p v-if="notice" class="subtle">{{ notice }}</p>
-    <p v-if="error" style="color: var(--del)">{{ error }}</p>
 
     <div class="tabs" role="tablist">
       <button v-for="t in tabs" :key="t.id" role="tab" :aria-selected="tab === t.id" @click="tab = t.id">
@@ -85,7 +83,7 @@
           </select>
         </label>
       </div>
-      <DiffView :diff="diff" />
+      <DiffView :diff="diff" :empty-label="diffEmpty" />
     </section>
 
     <section v-else-if="tab === 'branches'">
@@ -151,6 +149,15 @@ const cherrySha = ref("");
 const newBranch = ref("");
 const notice = ref("");
 const error = ref("");
+const flash = useFlash();
+
+const diffEmpty = computed(() => {
+  if (commits.value.length < 2) return "This object has only one commit — nothing to compare yet.";
+  if (fromSha.value && toSha.value && fromSha.value === toSha.value) {
+    return "These two revisions are the same. Choose different commits to compare.";
+  }
+  return "No textual changes between these revisions.";
+});
 
 const mine = computed(() => user.value && post.value && user.value.handle === post.value.owner);
 const canPR = computed(() => user.value && post.value && post.value.parentPostId && mine.value);
@@ -179,11 +186,11 @@ async function load() {
         fromSha.value = commits.value[0].sha;
       }
     } catch (e: any) {
-      error.value = e.message;
+      flash.error(e);
     }
   } catch (e: any) {
     post.value = null;
-    error.value = e.message;
+    flash.error(e);
   } finally {
     loading.value = false;
   }
@@ -191,6 +198,10 @@ async function load() {
 
 async function loadDiff() {
   if (!post.value || !fromSha.value || !toSha.value) return;
+  if (fromSha.value === toSha.value) {
+    diff.value = "";
+    return;
+  }
   const data = await api<{ diff: string }>(`/api/posts/${post.value.id}/diff?from=${fromSha.value}&to=${toSha.value}`);
   diff.value = data.diff || "";
 }
@@ -214,7 +225,7 @@ async function fork() {
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}/fork`, { method: "POST" });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 
@@ -232,7 +243,7 @@ async function openPR() {
     });
     await navigateTo(`/pulls/${data.pr.id}`);
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 
@@ -247,7 +258,7 @@ async function createBranch() {
     const b = await api<{ branches: any[] }>(`/api/posts/${post.value.id}/branches`);
     branches.value = b.branches || [];
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 
@@ -257,7 +268,7 @@ async function checkout(name: string) {
     body: JSON.stringify({ name }),
   });
   post.value = data.post;
-  notice.value = `Checked out ${name}`;
+  flash.ok(`Checked out ${name}`);
 }
 
 async function doCherry() {
@@ -268,11 +279,11 @@ async function doCherry() {
       body: JSON.stringify({ sha: cherrySha.value }),
     });
     post.value = data.post;
-    notice.value = `Cherry-picked ${cherrySha.value.slice(0, 7)}`;
+    flash.ok(`Cherry-picked ${cherrySha.value.slice(0, 7)}`);
     cherrySha.value = "";
     await load();
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 
@@ -283,7 +294,7 @@ async function adminDelete() {
     await api(`/api/admin/posts/${post.value.id}`, { method: "DELETE" });
     await navigateTo("/");
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   }
 }
 

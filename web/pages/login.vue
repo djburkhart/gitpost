@@ -12,7 +12,6 @@
           <label for="pw">Password</label>
           <input id="pw" v-model="password" type="password" autocomplete="current-password" required />
         </div>
-        <p v-if="error" class="subtle" style="color: var(--del)">{{ error }}</p>
         <button class="btn btn-primary" type="submit" style="width: 100%">Open session</button>
       </form>
       <p class="muted" style="margin: 16px 0 0; font-size: 0.9rem">
@@ -28,6 +27,7 @@ const { login } = useAuth();
 const handle = ref("");
 const password = ref("");
 const error = ref("");
+const flash = useFlash();
 const route = useRoute();
 
 async function submit() {
@@ -36,7 +36,7 @@ async function submit() {
     await login(handle.value, password.value);
     await navigateTo((route.query.next as string) || "/");
   } catch (e: any) {
-    error.value = e.message || "Could not sign in";
+    flash.error(e.message || "Could not sign in");
   }
 }
 </script>

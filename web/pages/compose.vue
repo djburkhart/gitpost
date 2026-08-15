@@ -31,7 +31,6 @@
         </div>
         <StoryEmbed v-if="story" :story="story" />
       </details>
-      <p v-if="error" style="color: var(--del)">{{ error }}</p>
       <div class="row">
         <button class="btn btn-primary" type="submit" :disabled="busy">Commit</button>
         <NuxtLink to="/" class="btn btn-ghost">Cancel</NuxtLink>
@@ -42,11 +41,11 @@
 
 <script setup lang="ts">
 const { user, ready, refresh } = useAuth();
+const flash = useFlash();
 const subject = ref("");
 const body = ref("");
 const storyUrl = ref("");
 const story = ref<any>(null);
-const error = ref("");
 const busy = ref(false);
 const editor = ref<{ getMarkdown: () => string } | null>(null);
 
@@ -71,7 +70,6 @@ async function previewStory() {
 }
 
 async function submit() {
-  error.value = "";
   busy.value = true;
   try {
     const markdown = editor.value?.getMarkdown() ?? body.value;
@@ -81,7 +79,7 @@ async function submit() {
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {
-    error.value = e.message || "Commit failed";
+    flash.error(e.message || "Commit failed");
   } finally {
     busy.value = false;
   }

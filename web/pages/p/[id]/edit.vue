@@ -14,7 +14,6 @@
         <label>Body</label>
         <WysimarkEditor ref="editor" v-model="body" placeholder="Amend the body. Markdown is welcome." />
       </div>
-      <p v-if="error" style="color: var(--del)">{{ error }}</p>
       <div class="row">
         <button class="btn btn-primary" type="submit" :disabled="busy">Commit amendment</button>
         <NuxtLink :to="`/p/${post.id}`" class="btn btn-ghost">Back</NuxtLink>
@@ -26,10 +25,10 @@
 <script setup lang="ts">
 const route = useRoute();
 const { user, ready, refresh } = useAuth();
+const flash = useFlash();
 const post = ref<any>(null);
 const subject = ref("");
 const body = ref("");
-const error = ref("");
 const busy = ref(false);
 const editor = ref<{ getMarkdown: () => string } | null>(null);
 
@@ -46,7 +45,6 @@ onMounted(async () => {
 
 async function submit() {
   busy.value = true;
-  error.value = "";
   try {
     const markdown = editor.value?.getMarkdown() ?? body.value;
     const data = await api<{ post: any }>(`/api/posts/${post.value.id}`, {
@@ -55,7 +53,7 @@ async function submit() {
     });
     await navigateTo(`/p/${data.post.id}`);
   } catch (e: any) {
-    error.value = e.message;
+    flash.error(e);
   } finally {
     busy.value = false;
   }

@@ -46,6 +46,7 @@ const password = ref("");
 const bio = ref("");
 const invite = ref("");
 const error = ref("");
+const flash = useFlash();
 const config = ref({ signupMode: "invite", minPassword: 12 });
 
 onMounted(async () => {
@@ -70,7 +71,7 @@ async function submit() {
     });
     await navigateTo("/");
   } catch (e: any) {
-    error.value = e.message || "Could not register";
+    flash.error(e.message || "Could not register");
   }
 }
 </script>

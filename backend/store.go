@@ -23,6 +23,9 @@ var (
 	errConflict      = errors.New("conflict")
 	errBadRequest    = errors.New("bad request")
 	errForbidden     = errors.New("forbidden")
+	errAlreadyApplied = errors.New("that commit is already in this history")
+	errCherryConflict = errors.New("cherry-pick conflicted with the current tip")
+	errGitFailed      = errors.New("that git action failed")
 )
 
 type User struct {
@@ -302,6 +305,23 @@ func (s *Store) gitEnv(repo string, env []string, args ...string) (string, error
 		return string(out), fmt.Errorf("git %s: %s (%w)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return string(out), nil
+}
+
+func friendlyGitErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "previous cherry-pick is now empty"),
+		strings.Contains(msg, "nothing to commit"),
+		strings.Contains(msg, "working tree clean"):
+		return errAlreadyApplied
+	case strings.Contains(msg, "conflict"):
+		return errCherryConflict
+	default:
+		return errGitFailed
+	}
 }
 
 func writePostFile(repo, subject, body string, story *Story) error {
@@ -950,7 +970,7 @@ func (s *Store) CherryPick(id, sha string, user *User) (*Post, error) {
 	}
 	if _, err := s.gitEnv(dir, env, "cherry-pick", "--allow-empty", sha); err != nil {
 		_, _ = s.git(dir, "cherry-pick", "--abort")
-		return nil, err
+		return nil, friendlyGitErr(err)
 	}
 	s.refreshPost(p)
 	p.UpdatedAt = time.Now().UTC()
@@ -986,7 +1006,7 @@ func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Pos
 	}
 	if _, err := s.gitEnv(dir, env, "cherry-pick", "--allow-empty", sha); err != nil {
 		_, _ = s.git(dir, "cherry-pick", "--abort")
-		return nil, err
+		return nil, friendlyGitErr(err)
 	}
 	s.refreshPost(dst)
 	dst.UpdatedAt = time.Now().UTC()
