@@ -1,0 +1,9 @@
+{
+  "name": "gitpost",
+  "private": true,
+  "scripts": {
+    "build": "pnpm --dir web generate",
+    "deploy": "sh scripts/cf-deploy.sh",
+    "deploy:preview": "sh scripts/cf-deploy.sh --temporary"
+  }
+}

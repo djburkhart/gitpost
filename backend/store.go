@@ -1,0 +1,1070 @@
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	errNotFound      = errors.New("not found")
+	errUnauthorized  = errors.New("unauthorized")
+	errConflict      = errors.New("conflict")
+	errBadRequest    = errors.New("bad request")
+	errForbidden     = errors.New("forbidden")
+)
+
+type User struct {
+	ID           string    `json:"id"`
+	Handle       string    `json:"handle"`
+	Name         string    `json:"name"`
+	Email        string    `json:"email"`
+	Bio          string    `json:"bio"`
+	PasswordHash string    `json:"-"`
+	PassStored   string    `json:"passwordHash"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+func (u User) Public() map[string]any {
+	return map[string]any{
+		"id":        u.ID,
+		"handle":    u.Handle,
+		"name":      u.Name,
+		"email":     u.Email,
+		"bio":       u.Bio,
+		"createdAt": u.CreatedAt,
+	}
+}
+
+type Post struct {
+	ID            string    `json:"id"`
+	Owner         string    `json:"owner"`
+	HeadSHA       string    `json:"headSha"`
+	ShortSHA      string    `json:"shortSha"`
+	Subject       string    `json:"subject"`
+	Slug          string    `json:"slug"`
+	Body          string    `json:"body,omitempty"`
+	ParentPostID  string    `json:"parentPostId,omitempty"`
+	ForkedFromSHA string    `json:"forkedFromSha,omitempty"`
+	StoryURL      string    `json:"storyUrl,omitempty"`
+	Story         *Story    `json:"story,omitempty"`
+	Stars         []string  `json:"stars"`
+	Watchers      []string  `json:"watchers"`
+	DefaultBranch string    `json:"defaultBranch"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	CommitCount   int       `json:"commitCount"`
+	ForkCount     int       `json:"forkCount"`
+}
+
+type Story struct {
+	URL      string `json:"url"`
+	Provider string `json:"provider"`
+	Repo     string `json:"repo"`
+	SHA      string `json:"sha"`
+	Message  string `json:"message"`
+	Author   string `json:"author"`
+	Date     string `json:"date"`
+	HTMLURL  string `json:"htmlUrl"`
+	Additions int   `json:"additions"`
+	Deletions int   `json:"deletions"`
+	Snippet  string `json:"snippet"`
+}
+
+type CommitInfo struct {
+	SHA       string    `json:"sha"`
+	ShortSHA  string    `json:"shortSha"`
+	Subject   string    `json:"subject"`
+	Body      string    `json:"body,omitempty"`
+	Author    string    `json:"author"`
+	Email     string    `json:"email"`
+	Date      time.Time `json:"date"`
+	Parents   []string  `json:"parents"`
+}
+
+type PullRequest struct {
+	ID           string     `json:"id"`
+	Number       int        `json:"number"`
+	Title        string     `json:"title"`
+	Body         string     `json:"body"`
+	Author       string     `json:"author"`
+	TargetPostID string     `json:"targetPostId"`
+	SourcePostID string     `json:"sourcePostId"`
+	SourceSHA    string     `json:"sourceSha"`
+	TargetSHA    string     `json:"targetSha"`
+	Status       string     `json:"status"`
+	MergedSHA    string     `json:"mergedSha,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+}
+
+type BranchInfo struct {
+	Name   string `json:"name"`
+	SHA    string `json:"sha"`
+	Head   bool   `json:"head"`
+	Author string `json:"author,omitempty"`
+}
+
+type Session struct {
+	Token     string    `json:"token"`
+	UserID    string    `json:"userId"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type persisted struct {
+	Users    []User        `json:"users"`
+	Posts    []Post        `json:"posts"`
+	PRs      []PullRequest `json:"prs"`
+	Sessions []Session     `json:"sessions"`
+	PRSeq    int           `json:"prSeq"`
+}
+
+type Store struct {
+	mu       sync.RWMutex
+	root     string
+	secret   []byte
+	users    map[string]*User
+	byHandle map[string]*User
+	posts    map[string]*Post
+	prs      map[string]*PullRequest
+	sessions map[string]*Session
+	prSeq    int
+}
+
+func NewStore(root string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Join(root, "repos"), 0o755); err != nil {
+		return nil, err
+	}
+	s := &Store{
+		root:     root,
+		secret:   []byte("gitpost-demo-secret-change-me"),
+		users:    map[string]*User{},
+		byHandle: map[string]*User{},
+		posts:    map[string]*Post{},
+		prs:      map[string]*PullRequest{},
+		sessions: map[string]*Session{},
+	}
+	_ = s.load()
+	return s, nil
+}
+
+func (s *Store) path() string { return filepath.Join(s.root, "state.json") }
+func (s *Store) repoDir(id string) string {
+	return filepath.Join(s.root, "repos", id)
+}
+
+func (s *Store) load() error {
+	b, err := os.ReadFile(s.path())
+	if err != nil {
+		return err
+	}
+	var p persisted
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	for i := range p.Users {
+		u := p.Users[i]
+		u.PasswordHash = u.PassStored
+		cp := u
+		s.users[u.ID] = &cp
+		s.byHandle[strings.ToLower(u.Handle)] = &cp
+	}
+	for i := range p.Posts {
+		cp := p.Posts[i]
+		s.posts[cp.ID] = &cp
+	}
+	for i := range p.PRs {
+		cp := p.PRs[i]
+		s.prs[cp.ID] = &cp
+	}
+	for i := range p.Sessions {
+		cp := p.Sessions[i]
+		if cp.ExpiresAt.After(time.Now()) {
+			s.sessions[cp.Token] = &cp
+		}
+	}
+	s.prSeq = p.PRSeq
+	return nil
+}
+
+func (s *Store) save() error {
+	p := persisted{PRSeq: s.prSeq}
+	for _, u := range s.users {
+		uu := *u
+		uu.PassStored = u.PasswordHash
+		p.Users = append(p.Users, uu)
+	}
+	for _, post := range s.posts {
+		p.Posts = append(p.Posts, *post)
+	}
+	for _, pr := range s.prs {
+		p.PRs = append(p.PRs, *pr)
+	}
+	for _, sess := range s.sessions {
+		p.Sessions = append(p.Sessions, *sess)
+	}
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path())
+}
+
+func idHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func hashPass(pw string) string {
+	sum := sha256.Sum256([]byte("gitpost:" + pw))
+	return hex.EncodeToString(sum[:])
+}
+
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	dash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			dash = false
+		} else if !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 48 {
+		out = out[:48]
+	}
+	if out == "" {
+		out = "post"
+	}
+	return out
+}
+
+func shortSHA(sha string) string {
+	if len(sha) >= 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+func (s *Store) git(repo string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %s (%w)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
+func (s *Store) gitEnv(repo string, env []string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %s (%w)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
+func writePostFile(repo, subject, body string, story *Story) error {
+	var b strings.Builder
+	b.WriteString("# ")
+	b.WriteString(subject)
+	b.WriteString("\n\n")
+	b.WriteString(strings.TrimSpace(body))
+	b.WriteString("\n")
+	if story != nil && story.URL != "" {
+		enc, _ := json.MarshalIndent(story, "", "  ")
+		b.WriteString("\n---\nstory.json\n")
+		b.Write(enc)
+		b.WriteString("\n")
+	}
+	return os.WriteFile(filepath.Join(repo, "POST.md"), []byte(b.String()), 0o644)
+}
+
+func parsePostFile(raw string) (subject, body string, story *Story) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	if i := strings.Index(raw, "\n---\nstory.json\n"); i >= 0 {
+		js := strings.TrimSpace(raw[i+len("\n---\nstory.json\n"):])
+		raw = raw[:i]
+		var st Story
+		if json.Unmarshal([]byte(js), &st) == nil {
+			story = &st
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "# ") {
+		nl := strings.IndexByte(raw, '\n')
+		if nl < 0 {
+			return strings.TrimSpace(raw[2:]), "", story
+		}
+		return strings.TrimSpace(raw[2:nl]), strings.TrimSpace(raw[nl+1:]), story
+	}
+	return "", raw, story
+}
+
+func (s *Store) commit(repo, name, email, subject string, when time.Time) (string, error) {
+	if _, err := s.git(repo, "add", "POST.md"); err != nil {
+		return "", err
+	}
+	env := []string{
+		"GIT_AUTHOR_NAME=" + name,
+		"GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name,
+		"GIT_COMMITTER_EMAIL=" + email,
+	}
+	if !when.IsZero() {
+		ts := when.Format(time.RFC3339)
+		env = append(env, "GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts)
+	}
+	if _, err := s.gitEnv(repo, env, "commit", "--allow-empty", "-m", subject); err != nil {
+		return "", err
+	}
+	sha, err := s.git(repo, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(sha), nil
+}
+
+func (s *Store) initRepo(id, name, email string) (string, error) {
+	dir := s.repoDir(id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	if _, err := exec.Command("git", "init", "-b", "main", dir).CombinedOutput(); err != nil {
+		return "", err
+	}
+	_, _ = s.git(dir, "config", "user.name", name)
+	_, _ = s.git(dir, "config", "user.email", email)
+	return dir, nil
+}
+
+func (s *Store) headSHA(id string) string {
+	out, err := s.git(s.repoDir(id), "rev-parse", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func (s *Store) commitCount(id string) int {
+	out, err := s.git(s.repoDir(id), "rev-list", "--count", "HEAD")
+	if err != nil {
+		return 0
+	}
+	var n int
+	fmt.Sscanf(strings.TrimSpace(out), "%d", &n)
+	return n
+}
+
+func (s *Store) readBlob(id, sha string) (string, error) {
+	spec := "HEAD:POST.md"
+	if sha != "" {
+		spec = sha + ":POST.md"
+	}
+	out, err := s.git(s.repoDir(id), "show", spec)
+	if err != nil {
+		return "", errNotFound
+	}
+	return out, nil
+}
+
+func (s *Store) refreshPost(p *Post) {
+	p.HeadSHA = s.headSHA(p.ID)
+	p.ShortSHA = shortSHA(p.HeadSHA)
+	p.CommitCount = s.commitCount(p.ID)
+	raw, err := s.readBlob(p.ID, "")
+	if err == nil {
+		sub, body, story := parsePostFile(raw)
+		if sub != "" {
+			p.Subject = sub
+		}
+		p.Body = body
+		if story != nil {
+			p.Story = story
+			p.StoryURL = story.URL
+		}
+	}
+	forks := 0
+	for _, o := range s.posts {
+		if o.ParentPostID == p.ID {
+			forks++
+		}
+	}
+	p.ForkCount = forks
+}
+
+func (s *Store) CreateUser(handle, name, email, bio, password string) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	handle = strings.ToLower(strings.TrimSpace(handle))
+	if handle == "" || password == "" {
+		return nil, errBadRequest
+	}
+	if s.byHandle[handle] != nil {
+		return nil, errConflict
+	}
+	if email == "" {
+		email = handle + "@gitpo.st"
+	}
+	if name == "" {
+		name = handle
+	}
+	u := &User{
+		ID:           idHex(8),
+		Handle:       handle,
+		Name:         name,
+		Email:        email,
+		Bio:          bio,
+		PasswordHash: hashPass(password),
+		CreatedAt:    time.Now().UTC(),
+	}
+	s.users[u.ID] = u
+	s.byHandle[handle] = u
+	return u, s.save()
+}
+
+func (s *Store) Authenticate(handle, password string) (*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u := s.byHandle[strings.ToLower(strings.TrimSpace(handle))]
+	if u == nil || u.PasswordHash != hashPass(password) {
+		return nil, errUnauthorized
+	}
+	return u, nil
+}
+
+func (s *Store) CreateSession(userID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tok := idHex(24)
+	mac := hmac.New(sha256.New, s.secret)
+	mac.Write([]byte(tok))
+	signed := tok + "." + hex.EncodeToString(mac.Sum(nil))[:16]
+	s.sessions[signed] = &Session{
+		Token:     signed,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
+	}
+	return signed, s.save()
+}
+
+func (s *Store) UserBySession(token string) *User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sess := s.sessions[token]
+	if sess == nil || sess.ExpiresAt.Before(time.Now()) {
+		return nil
+	}
+	return s.users[sess.UserID]
+}
+
+func (s *Store) DeleteSession(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, token)
+	_ = s.save()
+}
+
+func (s *Store) UserByHandle(handle string) *User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.byHandle[strings.ToLower(handle)]
+}
+
+func (s *Store) UserByID(id string) *User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.users[id]
+}
+
+func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *Story, when time.Time) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return nil, errBadRequest
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	id := idHex(5)
+	dir, err := s.initRepo(id, owner.Name, owner.Email)
+	if err != nil {
+		return nil, err
+	}
+	if err := writePostFile(dir, subject, body, story); err != nil {
+		return nil, err
+	}
+	sha, err := s.commit(dir, owner.Name, owner.Email, subject, when)
+	if err != nil {
+		return nil, err
+	}
+	p := &Post{
+		ID:            id,
+		Owner:         owner.Handle,
+		HeadSHA:       sha,
+		ShortSHA:      shortSHA(sha),
+		Subject:       subject,
+		Slug:          slugify(subject),
+		Body:          body,
+		StoryURL:      storyURL,
+		Story:         story,
+		Stars:         []string{},
+		Watchers:      []string{},
+		DefaultBranch: "main",
+		CreatedAt:     when,
+		UpdatedAt:     when,
+		CommitCount:   1,
+	}
+	s.posts[id] = p
+	return p, s.save()
+}
+
+func (s *Store) AmendPost(id string, editor *User, subject, body string, story *Story) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return nil, errNotFound
+	}
+	if p.Owner != editor.Handle {
+		return nil, errForbidden
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		subject = p.Subject
+	}
+	dir := s.repoDir(id)
+	if err := writePostFile(dir, subject, body, story); err != nil {
+		return nil, err
+	}
+	sha, err := s.commit(dir, editor.Name, editor.Email, subject, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	p.Subject = subject
+	p.Body = body
+	p.Story = story
+	if story != nil {
+		p.StoryURL = story.URL
+	}
+	p.HeadSHA = sha
+	p.ShortSHA = shortSHA(sha)
+	p.Slug = slugify(subject)
+	p.UpdatedAt = time.Now().UTC()
+	p.CommitCount = s.commitCount(id)
+	return p, s.save()
+}
+
+func (s *Store) FindPost(ref string) *Post {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p := s.posts[ref]; p != nil {
+		cp := *p
+		s.refreshPost(&cp)
+		return &cp
+	}
+	ref = strings.ToLower(ref)
+	var found *Post
+	for _, p := range s.posts {
+		if strings.ToLower(p.ID) == ref || strings.HasPrefix(strings.ToLower(p.HeadSHA), ref) || strings.ToLower(p.ShortSHA) == ref {
+			cp := *p
+			s.refreshPost(&cp)
+			found = &cp
+			break
+		}
+	}
+	return found
+}
+
+func (s *Store) GetPostLocked(id string) *Post {
+	return s.posts[id]
+}
+
+func (s *Store) Feed() []Post {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Post, 0, len(s.posts))
+	for _, p := range s.posts {
+		s.refreshPost(p)
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
+}
+
+func (s *Store) UserLog(handle string) []Post {
+	all := s.Feed()
+	out := []Post{}
+	h := strings.ToLower(handle)
+	for _, p := range all {
+		if strings.ToLower(p.Owner) == h {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Store) History(id string) ([]CommitInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.posts[id] == nil {
+		return nil, errNotFound
+	}
+	out, err := s.git(s.repoDir(id), "log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e")
+	if err != nil {
+		return nil, err
+	}
+	var commits []CommitInfo
+	for _, rec := range strings.Split(out, "\x1e") {
+		rec = strings.TrimSpace(rec)
+		if rec == "" {
+			continue
+		}
+		parts := strings.Split(rec, "\x1f")
+		if len(parts) < 5 {
+			continue
+		}
+		dt, _ := time.Parse(time.RFC3339, parts[3])
+		body := ""
+		if len(parts) > 5 {
+			body = strings.TrimSpace(parts[5])
+		}
+		commits = append(commits, CommitInfo{
+			SHA:      parts[0],
+			ShortSHA: shortSHA(parts[0]),
+			Author:   parts[1],
+			Email:    parts[2],
+			Date:     dt,
+			Subject:  parts[4],
+			Body:     body,
+		})
+	}
+	return commits, nil
+}
+
+func (s *Store) Diff(id, from, to string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.posts[id] == nil {
+		return "", errNotFound
+	}
+	if from == "" || to == "" {
+		out, err := s.git(s.repoDir(id), "show", "--format=", "HEAD", "--", "POST.md")
+		return out, err
+	}
+	out, err := s.git(s.repoDir(id), "diff", from, to, "--", "POST.md")
+	return out, err
+}
+
+func (s *Store) Blob(id, sha string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.posts[id] == nil {
+		return "", errNotFound
+	}
+	return s.readBlob(id, sha)
+}
+
+func (s *Store) ToggleStar(id, handle string) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return nil, errNotFound
+	}
+	p.Stars = toggle(p.Stars, handle)
+	s.refreshPost(p)
+	return p, s.save()
+}
+
+func (s *Store) ToggleWatch(id, handle string) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return nil, errNotFound
+	}
+	p.Watchers = toggle(p.Watchers, handle)
+	s.refreshPost(p)
+	return p, s.save()
+}
+
+func toggle(list []string, v string) []string {
+	out := []string{}
+	found := false
+	for _, x := range list {
+		if x == v {
+			found = true
+			continue
+		}
+		out = append(out, x)
+	}
+	if !found {
+		out = append(out, v)
+	}
+	return out
+}
+
+func (s *Store) Fork(id string, user *User) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := s.posts[id]
+	if src == nil {
+		return nil, errNotFound
+	}
+	nid := idHex(5)
+	srcDir := s.repoDir(id)
+	dstDir := s.repoDir(nid)
+	if err := os.MkdirAll(filepath.Dir(dstDir), 0o755); err != nil {
+		return nil, err
+	}
+	if out, err := exec.Command("git", "clone", srcDir, dstDir).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("clone: %s (%w)", out, err)
+	}
+	_, _ = s.git(dstDir, "config", "user.name", user.Name)
+	_, _ = s.git(dstDir, "config", "user.email", user.Email)
+	now := time.Now().UTC()
+	subject := src.Subject
+	// leave content as-is; fork commit records the fork
+	sha, err := s.commit(dstDir, user.Name, user.Email, "fork: "+subject, now)
+	if err != nil {
+		return nil, err
+	}
+	p := &Post{
+		ID:            nid,
+		Owner:         user.Handle,
+		HeadSHA:       sha,
+		ShortSHA:      shortSHA(sha),
+		Subject:       subject,
+		Slug:          slugify(subject),
+		Body:          src.Body,
+		ParentPostID:  src.ID,
+		ForkedFromSHA: src.HeadSHA,
+		StoryURL:      src.StoryURL,
+		Story:         src.Story,
+		Stars:         []string{},
+		Watchers:      []string{},
+		DefaultBranch: "main",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		CommitCount:   s.commitCount(nid),
+	}
+	s.posts[nid] = p
+	s.refreshPost(src)
+	return p, s.save()
+}
+
+func (s *Store) Branches(id string) ([]BranchInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.posts[id] == nil {
+		return nil, errNotFound
+	}
+	out, err := s.git(s.repoDir(id), "for-each-ref", "--format=%(refname:short)%09%(objectname)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	head := s.headSHA(id)
+	var list []BranchInfo
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		list = append(list, BranchInfo{
+			Name: parts[0],
+			SHA:  parts[1],
+			Head: parts[1] == head || parts[0] == "main",
+		})
+	}
+	return list, nil
+}
+
+func (s *Store) CreateBranch(id, name, from string, user *User) (*BranchInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return nil, errNotFound
+	}
+	if p.Owner != user.Handle {
+		return nil, errForbidden
+	}
+	name = slugify(name)
+	if name == "" || name == "main" {
+		return nil, errBadRequest
+	}
+	args := []string{"branch", name}
+	if from != "" {
+		args = []string{"branch", name, from}
+	}
+	if _, err := s.git(s.repoDir(id), args...); err != nil {
+		return nil, err
+	}
+	sha, _ := s.git(s.repoDir(id), "rev-parse", name)
+	return &BranchInfo{Name: name, SHA: strings.TrimSpace(sha)}, nil
+}
+
+func (s *Store) CheckoutBranch(id, name string, user *User) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return errNotFound
+	}
+	if p.Owner != user.Handle {
+		return errForbidden
+	}
+	if _, err := s.git(s.repoDir(id), "checkout", name); err != nil {
+		return err
+	}
+	s.refreshPost(p)
+	p.DefaultBranch = name
+	p.UpdatedAt = time.Now().UTC()
+	return s.save()
+}
+
+func (s *Store) CherryPick(id, sha string, user *User) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.posts[id]
+	if p == nil {
+		return nil, errNotFound
+	}
+	if p.Owner != user.Handle {
+		return nil, errForbidden
+	}
+	dir := s.repoDir(id)
+	env := []string{
+		"GIT_AUTHOR_NAME=" + user.Name,
+		"GIT_AUTHOR_EMAIL=" + user.Email,
+		"GIT_COMMITTER_NAME=" + user.Name,
+		"GIT_COMMITTER_EMAIL=" + user.Email,
+	}
+	if _, err := s.gitEnv(dir, env, "cherry-pick", "--allow-empty", sha); err != nil {
+		_, _ = s.git(dir, "cherry-pick", "--abort")
+		return nil, err
+	}
+	s.refreshPost(p)
+	p.UpdatedAt = time.Now().UTC()
+	return p, s.save()
+}
+
+func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Post, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dst := s.posts[targetID]
+	src := s.posts[sourceID]
+	if dst == nil || src == nil {
+		return nil, errNotFound
+	}
+	if dst.Owner != user.Handle {
+		return nil, errForbidden
+	}
+	// fetch source object into dest via a temporary remote
+	dir := s.repoDir(targetID)
+	remote := "src-" + sourceID
+	_, _ = s.git(dir, "remote", "remove", remote)
+	if _, err := s.git(dir, "remote", "add", remote, s.repoDir(sourceID)); err != nil {
+		return nil, err
+	}
+	if _, err := s.git(dir, "fetch", remote); err != nil {
+		return nil, err
+	}
+	env := []string{
+		"GIT_AUTHOR_NAME=" + user.Name,
+		"GIT_AUTHOR_EMAIL=" + user.Email,
+		"GIT_COMMITTER_NAME=" + user.Name,
+		"GIT_COMMITTER_EMAIL=" + user.Email,
+	}
+	if _, err := s.gitEnv(dir, env, "cherry-pick", "--allow-empty", sha); err != nil {
+		_, _ = s.git(dir, "cherry-pick", "--abort")
+		return nil, err
+	}
+	s.refreshPost(dst)
+	dst.UpdatedAt = time.Now().UTC()
+	return dst, s.save()
+}
+
+func (s *Store) OpenPR(author *User, title, body, sourceID, targetID string) (*PullRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := s.posts[sourceID]
+	dst := s.posts[targetID]
+	if src == nil || dst == nil {
+		return nil, errNotFound
+	}
+	if src.Owner != author.Handle {
+		return nil, errForbidden
+	}
+	if title == "" {
+		title = src.Subject
+	}
+	s.prSeq++
+	now := time.Now().UTC()
+	pr := &PullRequest{
+		ID:           idHex(4),
+		Number:       s.prSeq,
+		Title:        title,
+		Body:         body,
+		Author:       author.Handle,
+		TargetPostID: targetID,
+		SourcePostID: sourceID,
+		SourceSHA:    src.HeadSHA,
+		TargetSHA:    dst.HeadSHA,
+		Status:       "open",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	s.prs[pr.ID] = pr
+	return pr, s.save()
+}
+
+func (s *Store) ListPRs(postID string) []PullRequest {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []PullRequest{}
+	for _, pr := range s.prs {
+		if postID == "" || pr.TargetPostID == postID || pr.SourcePostID == postID {
+			out = append(out, *pr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Number > out[j].Number })
+	return out
+}
+
+func (s *Store) GetPR(id string) *PullRequest {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if pr := s.prs[id]; pr != nil {
+		cp := *pr
+		return &cp
+	}
+	for _, pr := range s.prs {
+		if fmt.Sprintf("%d", pr.Number) == id {
+			cp := *pr
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (s *Store) MergePR(id string, user *User) (*PullRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pr := s.prs[id]
+	if pr == nil {
+		return nil, errNotFound
+	}
+	dst := s.posts[pr.TargetPostID]
+	src := s.posts[pr.SourcePostID]
+	if dst == nil || src == nil {
+		return nil, errNotFound
+	}
+	if dst.Owner != user.Handle {
+		return nil, errForbidden
+	}
+	if pr.Status != "open" {
+		return nil, errConflict
+	}
+	dir := s.repoDir(dst.ID)
+	remote := "pr-" + pr.ID
+	_, _ = s.git(dir, "remote", "remove", remote)
+	if _, err := s.git(dir, "remote", "add", remote, s.repoDir(src.ID)); err != nil {
+		return nil, err
+	}
+	if _, err := s.git(dir, "fetch", remote); err != nil {
+		return nil, err
+	}
+	env := []string{
+		"GIT_AUTHOR_NAME=" + user.Name,
+		"GIT_AUTHOR_EMAIL=" + user.Email,
+		"GIT_COMMITTER_NAME=" + user.Name,
+		"GIT_COMMITTER_EMAIL=" + user.Email,
+	}
+	// merge the forked tip
+	if _, err := s.gitEnv(dir, env, "merge", "--no-ff", "-m", "Merge PR #"+fmt.Sprint(pr.Number)+": "+pr.Title, "FETCH_HEAD"); err != nil {
+		// fallback: take their POST.md as ours
+		raw, rerr := os.ReadFile(filepath.Join(s.repoDir(src.ID), "POST.md"))
+		if rerr != nil {
+			return nil, err
+		}
+		_, _ = s.git(dir, "merge", "--abort")
+		if werr := os.WriteFile(filepath.Join(dir, "POST.md"), raw, 0o644); werr != nil {
+			return nil, werr
+		}
+		sha, cerr := s.commit(dir, user.Name, user.Email, "Merge PR #"+fmt.Sprint(pr.Number)+": "+pr.Title, time.Now().UTC())
+		if cerr != nil {
+			return nil, cerr
+		}
+		pr.MergedSHA = sha
+	} else {
+		pr.MergedSHA = s.headSHA(dst.ID)
+	}
+	pr.Status = "merged"
+	pr.UpdatedAt = time.Now().UTC()
+	s.refreshPost(dst)
+	dst.UpdatedAt = pr.UpdatedAt
+	return pr, s.save()
+}
+
+func (s *Store) ClosePR(id string, user *User) (*PullRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pr := s.prs[id]
+	if pr == nil {
+		return nil, errNotFound
+	}
+	dst := s.posts[pr.TargetPostID]
+	if dst == nil {
+		return nil, errNotFound
+	}
+	if dst.Owner != user.Handle && pr.Author != user.Handle {
+		return nil, errForbidden
+	}
+	if pr.Status != "open" {
+		return nil, errConflict
+	}
+	pr.Status = "closed"
+	pr.UpdatedAt = time.Now().UTC()
+	return pr, s.save()
+}
+
+func (s *Store) PRDiff(pr *PullRequest) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := filepath.Join(s.repoDir(pr.SourcePostID), "POST.md")
+	dst := filepath.Join(s.repoDir(pr.TargetPostID), "POST.md")
+	cmd := exec.Command("git", "diff", "--no-index", "--", dst, src)
+	out, _ := cmd.CombinedOutput()
+	return string(out), nil
+}

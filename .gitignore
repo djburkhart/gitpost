@@ -1,0 +1,13 @@
+node_modules
+web/node_modules
+web/.nuxt
+web/.output
+web/dist
+data
+backend/gitpost
+screenshots
+*.log
+.wrangler
+.dev.vars
+.env
+.DS_Store
