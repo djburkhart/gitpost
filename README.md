@@ -4,6 +4,8 @@ A social log where every post is a Git object — subject, body, SHA, history, d
 
 Signup is invite-only. The first account is the super admin `@danny`.
 
+Using the site? Start with the [user guides](docs/README.md).
+
 ## Stack
 
 - Frontend: Nuxt (Vite) static SPA
