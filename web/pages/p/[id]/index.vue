@@ -58,6 +58,15 @@
           <NuxtLink :to="`/p/${d.id}`">{{ d.subject }}</NuxtLink>
         </p>
       </div>
+      <div v-if="post.bridges?.length" class="attr-block">
+        <p class="kicker" style="margin: 0 0 8px">idea ↔ code</p>
+        <p v-for="b in post.bridges" :key="b.url" class="muted" style="margin: 0 0 6px">
+          <span class="pill">{{ b.kind }}</span>
+          <span v-if="b.state" class="pill">{{ b.state }}</span>
+          <a :href="b.htmlUrl || b.url" target="_blank" rel="noreferrer">{{ b.repo }} {{ b.number ? "#" + b.number : "" }} {{ b.title }}</a>
+          <button v-if="post.canPush" class="btn btn-ghost btn-sm" type="button" @click="unlink(b.url)">unlink</button>
+        </p>
+      </div>
       <div v-if="post.topics?.length" class="topic-row">
         <NuxtLink v-for="t in post.topics" :key="t" :to="`/explore?q=remote:${t}`" class="pill">remote:{{ t }}</NuxtLink>
         <button v-if="user && !followingAll" class="btn btn-ghost btn-sm" type="button" @click="followTopics">Track remotes</button>
@@ -72,6 +81,7 @@
         Watch
       </button>
       <button class="btn btn-sm" @click="startFork">Fork</button>
+      <button v-if="post.canPush" class="btn btn-sm" type="button" @click="showBridge = true">Link issue / PR</button>
       <NuxtLink v-if="post.canPush" :to="`/p/${post.id}/edit`" class="btn btn-sm">Amend</NuxtLink>
       <button v-if="canPR" class="btn btn-sm" @click="openPR">Open pull request</button>
       <button v-if="canPropose" class="btn btn-sm" :class="{ 'btn-primary': proposeMode }" type="button" @click="togglePropose">
@@ -98,11 +108,12 @@
       </template>
       <template v-else>
         <TakeCarousel :takes="forks" :parent-id="post.parentPostId" />
+        <StoryEmbed v-if="post.story && post.kind === 'story'" :story="post.story" />
         <p class="subtle blame-hint">Hover a paragraph for blame. Select a sentence to cherry-pick it.</p>
         <div class="read-body" @mouseup="onSelect" @keyup="onSelect">
           <BlameBody :post-id="post.id" :fallback="post.body" />
         </div>
-        <StoryEmbed v-if="post.story" :story="post.story" />
+        <StoryEmbed v-if="post.story && post.kind !== 'story'" :story="post.story" />
       </template>
     </section>
 
@@ -235,6 +246,7 @@
     </section>
 
     <ForkSheet v-if="showFork" :post-id="post.id" @close="showFork = false" @forked="onForked" />
+    <BridgeSheet v-if="showBridge" :post-id="post.id" @close="showBridge = false" @linked="onLinked" />
     <CherryPickSheet
       v-if="excerpt"
       :source-id="post.id"
@@ -294,6 +306,7 @@ const cherrySha = ref("");
 const newBranch = ref("");
 const flash = useFlash();
 const showFork = ref(false);
+const showBridge = ref(false);
 const proposeMode = ref(false);
 const proposal = ref<{ index: number; text: string } | null>(null);
 const remotes = ref<string[]>([]);
@@ -403,6 +416,20 @@ function startFork() {
 function onForked(id: string) {
   showFork.value = false;
   navigateTo(`/p/${id}/edit`);
+}
+
+function onLinked() {
+  showBridge.value = false;
+  load();
+}
+
+async function unlink(url: string) {
+  try {
+    const data = await api<{ post: any }>(`/api/posts/${post.value.id}/bridges?url=${encodeURIComponent(url)}`, { method: "DELETE" });
+    post.value = data.post;
+  } catch (e: any) {
+    flash.error(e);
+  }
 }
 
 function onSelect() {

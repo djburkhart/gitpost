@@ -120,6 +120,8 @@ type Post struct {
 	ForkIntentNote string   `json:"forkIntentNote,omitempty"`
 	StoryURL      string    `json:"storyUrl,omitempty"`
 	Story         *Story    `json:"story,omitempty"`
+	Kind          string    `json:"kind,omitempty"`
+	Bridges       []Bridge  `json:"bridges,omitempty"`
 	Stars         []string  `json:"stars"`
 	Watchers      []string  `json:"watchers"`
 	DefaultBranch string    `json:"defaultBranch"`
@@ -139,17 +141,66 @@ type Post struct {
 }
 
 type Story struct {
-	URL      string `json:"url"`
-	Provider string `json:"provider"`
-	Repo     string `json:"repo"`
-	SHA      string `json:"sha"`
-	Message  string `json:"message"`
-	Author   string `json:"author"`
-	Date     string `json:"date"`
-	HTMLURL  string `json:"htmlUrl"`
-	Additions int   `json:"additions"`
-	Deletions int   `json:"deletions"`
-	Snippet  string `json:"snippet"`
+	URL       string      `json:"url"`
+	Provider  string      `json:"provider"`
+	Repo      string      `json:"repo"`
+	SHA       string      `json:"sha"`
+	Message   string      `json:"message"`
+	Author    string      `json:"author"`
+	Date      string      `json:"date"`
+	HTMLURL   string      `json:"htmlUrl"`
+	Additions int         `json:"additions"`
+	Deletions int         `json:"deletions"`
+	Snippet   string      `json:"snippet"`
+	Kind      string      `json:"kind,omitempty"`
+	Number    string      `json:"number,omitempty"`
+	Title     string      `json:"title,omitempty"`
+	State     string      `json:"state,omitempty"`
+	Files     []StoryFile `json:"files,omitempty"`
+}
+
+type StoryFile struct {
+	Filename  string `json:"filename"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+type Bridge struct {
+	URL       string    `json:"url"`
+	Provider  string    `json:"provider"`
+	Repo      string    `json:"repo,omitempty"`
+	Kind      string    `json:"kind"`
+	Number    string    `json:"number,omitempty"`
+	Title     string    `json:"title,omitempty"`
+	State     string    `json:"state,omitempty"`
+	SHA       string    `json:"sha,omitempty"`
+	HTMLURL   string    `json:"htmlUrl,omitempty"`
+	Direction string    `json:"direction,omitempty"`
+	CreatedBy string    `json:"createdBy,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type RepoWatch struct {
+	ID        string    `json:"id"`
+	Handle    string    `json:"handle"`
+	Repo      string    `json:"repo"`
+	Provider  string    `json:"provider"`
+	LastTag   string    `json:"lastTag,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type ReleaseHint struct {
+	ID          string    `json:"id"`
+	Handle      string    `json:"handle"`
+	Repo        string    `json:"repo"`
+	Tag         string    `json:"tag"`
+	Name        string    `json:"name"`
+	Body        string    `json:"body"`
+	HTMLURL     string    `json:"htmlUrl"`
+	PublishedAt string    `json:"publishedAt,omitempty"`
+	Dismissed   bool      `json:"dismissed"`
+	DraftID     string    `json:"draftId,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 
 type CommitInfo struct {
@@ -226,6 +277,8 @@ type persisted struct {
 	Comments []PostComment  `json:"comments"`
 	Drafts   []Draft        `json:"drafts"`
 	Notices  []Notice       `json:"notices"`
+	Watches  []RepoWatch    `json:"watches"`
+	Hints    []ReleaseHint  `json:"hints"`
 }
 
 type Store struct {
@@ -246,6 +299,8 @@ type Store struct {
 	comments []PostComment
 	drafts   map[string]*Draft
 	notices  []Notice
+	watches  []RepoWatch
+	hints    []ReleaseHint
 }
 
 func NewStore(root string) (*Store, error) {
@@ -325,6 +380,8 @@ func (s *Store) load() error {
 	}
 	s.comments = p.Comments
 	s.notices = p.Notices
+	s.watches = p.Watches
+	s.hints = p.Hints
 	s.drafts = map[string]*Draft{}
 	for i := range p.Drafts {
 		cp := p.Drafts[i]
@@ -357,6 +414,8 @@ func (s *Store) save() error {
 	p.Events = s.events
 	p.Comments = s.comments
 	p.Notices = s.notices
+	p.Watches = s.watches
+	p.Hints = s.hints
 	for _, d := range s.drafts {
 		p.Drafts = append(p.Drafts, *d)
 	}
@@ -770,6 +829,12 @@ func (s *Store) CreatePost(owner *User, subject, body, storyURL string, story *S
 		CommitCount:   1,
 		Topics:        extractTopics(topics, subject, body),
 	}
+	if story != nil && story.Kind != "" && story.Kind != "link" {
+		p.Kind = "story"
+		if b := storyToBridge(story, owner.Handle, "code-to-writing"); b.URL != "" {
+			p.Bridges = []Bridge{b}
+		}
+	}
 	s.posts[id] = p
 	s.recordLocked("commit", id, sha, owner.Handle)
 	return p, s.save()
@@ -802,6 +867,9 @@ func (s *Store) AmendPost(id string, editor *User, subject, body string, story *
 	p.Story = story
 	if story != nil {
 		p.StoryURL = story.URL
+		if story.Kind != "" && story.Kind != "link" {
+			p.Kind = "story"
+		}
 	}
 	p.HeadSHA = sha
 	p.ShortSHA = shortSHA(sha)

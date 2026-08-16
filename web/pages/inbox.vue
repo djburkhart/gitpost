@@ -10,11 +10,17 @@
       <li v-for="n in notices" :key="n.id" class="invite-row" :class="{ unread: !n.read }">
         <div>
           <div>
-            <NuxtLink :to="`/u/${n.actor}`">@{{ n.actor }}</NuxtLink>
-            {{ n.kind === "fork" ? "forked" : "cherry-picked" }}
-            <NuxtLink v-if="n.sourcePostId" :to="`/p/${n.sourcePostId}`">your object</NuxtLink>
-            into
-            <NuxtLink :to="`/p/${n.postId}`">{{ n.subject || n.postId.slice(0, 8) }}</NuxtLink>
+            <template v-if="n.kind === 'release'">
+              {{ n.subject }} shipped —
+              <NuxtLink to="/changelog">write the changelog</NuxtLink>
+            </template>
+            <template v-else>
+              <NuxtLink :to="`/u/${n.actor}`">@{{ n.actor }}</NuxtLink>
+              {{ n.kind === "fork" ? "forked" : "cherry-picked" }}
+              <NuxtLink v-if="n.sourcePostId" :to="`/p/${n.sourcePostId}`">your object</NuxtLink>
+              into
+              <NuxtLink :to="`/p/${n.postId}`">{{ n.subject || n.postId.slice(0, 8) }}</NuxtLink>
+            </template>
           </div>
           <div class="log-meta">
             <time>{{ formatAgo(n.createdAt) }}</time>

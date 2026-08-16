@@ -414,6 +414,27 @@ export class GitPostStore extends DurableObject<Env> {
         read INTEGER,
         created_at TEXT
       )`,
+      `CREATE TABLE IF NOT EXISTS watches (
+        id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        provider TEXT,
+        last_tag TEXT,
+        created_at TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS hints (
+        id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        repo TEXT,
+        tag TEXT,
+        name TEXT,
+        body TEXT,
+        html_url TEXT,
+        published_at TEXT,
+        dismissed INTEGER,
+        draft_id TEXT,
+        created_at TEXT
+      )`,
       `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
     ];
     for (const stmt of statements) {
@@ -441,6 +462,8 @@ export class GitPostStore extends DurableObject<Env> {
       "ALTER TABLE commits ADD COLUMN trailers TEXT",
       "ALTER TABLE posts ADD COLUMN derived_json TEXT",
       "ALTER TABLE users ADD COLUMN quiet_derived INTEGER",
+      "ALTER TABLE posts ADD COLUMN kind TEXT",
+      "ALTER TABLE posts ADD COLUMN bridges_json TEXT",
     ]) {
       try {
         this.ctx.storage.sql.exec(extra);
@@ -588,6 +611,8 @@ export class GitPostStore extends DurableObject<Env> {
       forkIntentNote: p.fork_intent_note || "",
       storyUrl: p.story_url || "",
       story,
+      kind: p.kind || (story && (story as any).kind && (story as any).kind !== "link" ? "story" : ""),
+      bridges: parseReviews(p.bridges_json),
       starCount: stars.length,
       watchCount: watches.length,
       stars,
@@ -777,6 +802,90 @@ export class GitPostStore extends DurableObject<Env> {
     return out;
   }
 
+  private listWatches(handle: string) {
+    return this.sql<any>("SELECT * FROM watches WHERE handle = ?", handle).map((w) => ({
+      id: w.id, handle: w.handle, repo: w.repo, provider: w.provider, lastTag: w.last_tag, createdAt: w.created_at,
+    }));
+  }
+
+  private parseRepo(raw: string) {
+    const m = String(raw || "").trim().match(/(?:https?:\/\/github\.com\/)?([^/\s]+)\/([^/\s#?]+)/i);
+    if (!m) return "";
+    return m[1] + "/" + m[2].replace(/\.git$/, "");
+  }
+
+  private watchRepo(handle: string, raw: string) {
+    const repo = this.parseRepo(raw);
+    if (!repo) return null;
+    const existing = this.one<any>("SELECT * FROM watches WHERE handle = ? AND repo = ?", handle, repo);
+    if (existing) return { id: existing.id, handle, repo, provider: "github", lastTag: existing.last_tag, createdAt: existing.created_at };
+    const id = hex(4);
+    const ts = new Date().toISOString();
+    this.sql("INSERT INTO watches (id, handle, repo, provider, last_tag, created_at) VALUES (?, ?, ?, 'github', '', ?)", id, handle, repo, ts);
+    return { id, handle, repo, provider: "github", lastTag: "", createdAt: ts };
+  }
+
+  private unwatchRepo(handle: string, raw: string) {
+    const repo = this.parseRepo(raw) || raw;
+    this.sql("DELETE FROM watches WHERE handle = ? AND repo = ?", handle, repo);
+  }
+
+  private hintsFor(handle: string) {
+    return this.sql<any>("SELECT * FROM hints WHERE handle = ? AND (dismissed IS NULL OR dismissed = 0) ORDER BY created_at DESC", handle).map((h) => ({
+      id: h.id, handle: h.handle, repo: h.repo, tag: h.tag, name: h.name, body: h.body,
+      htmlUrl: h.html_url, publishedAt: h.published_at, dismissed: !!h.dismissed, draftId: h.draft_id, createdAt: h.created_at,
+    }));
+  }
+
+  private async refreshChangelog(handle: string) {
+    for (const w of this.sql<any>("SELECT * FROM watches WHERE handle = ?", handle)) {
+      const [owner, repo] = String(w.repo).split("/");
+      if (!owner || !repo) continue;
+      try {
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=5`, {
+          headers: { Accept: "application/vnd.github+json", "User-Agent": "gitpo.st" },
+        });
+        if (!res.ok) continue;
+        const list: any[] = await res.json();
+        const latest = list.find((r) => !r.draft && r.tag_name);
+        if (!latest) continue;
+        const exists = this.one<any>("SELECT id FROM hints WHERE handle = ? AND repo = ? AND tag = ?", handle, w.repo, latest.tag_name);
+        if (!exists) {
+          this.sql(
+            "INSERT INTO hints (id, handle, repo, tag, name, body, html_url, published_at, dismissed, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', ?)",
+            hex(5), handle, w.repo, latest.tag_name, latest.name || latest.tag_name, latest.body || "", latest.html_url || "", latest.published_at || "", new Date().toISOString(),
+          );
+          this.sql(
+            "INSERT INTO notices (id, handle, kind, actor, post_id, source_post_id, sha, subject, read, created_at) VALUES (?, ?, 'release', 'github', '', '', '', ?, 0, ?)",
+            hex(6), handle, `${w.repo} ${latest.tag_name}`, new Date().toISOString(),
+          );
+        }
+        this.sql("UPDATE watches SET last_tag = ? WHERE id = ?", latest.tag_name, w.id);
+      } catch { /* ignore */ }
+    }
+    return this.hintsFor(handle);
+  }
+
+  private draftFromHint(handle: string, id: string) {
+    const h = this.one<any>("SELECT * FROM hints WHERE id = ? AND handle = ?", id, handle);
+    if (!h) return null;
+    const subject = h.name && h.name !== h.tag ? h.name : `${h.repo} ${h.tag}`;
+    const body = `Shipped ${h.repo} \`${h.tag}\`.\n\n${h.body || ""}`;
+    const did = h.draft_id || hex(5);
+    const ts = new Date().toISOString();
+    if (h.draft_id) {
+      this.sql("UPDATE drafts SET subject = ?, body = ?, story_url = ?, updated_at = ? WHERE id = ?", subject, body, h.html_url || "", ts, did);
+    } else {
+      this.sql(
+        "INSERT INTO drafts (id, owner, subject, body, story_url, topics_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        did, handle, subject, body, h.html_url || "", JSON.stringify(["changelog"]), ts, ts,
+      );
+      this.sql("UPDATE hints SET draft_id = ? WHERE id = ?", did, id);
+    }
+    const d = this.one<any>("SELECT * FROM drafts WHERE id = ?", did);
+    return { id: d.id, owner: d.owner, subject: d.subject, body: d.body, storyUrl: d.story_url, topics: parseTopics(d.topics_json), createdAt: d.created_at, updatedAt: d.updated_at };
+  }
+
   private async commit(postId: string, user: User, subject: string, body: string, story: unknown, when: string, parentSha: string, branch = "main") {
     const file = encodePostFile(subject, body, story);
     const payload = `tree ${await shaHex("SHA-1", file)}\n${parentSha ? `parent ${parentSha}\n` : ""}author ${user.name} <${user.email}> ${Math.floor(new Date(when).getTime() / 1000)} +0000\ncommitter ${user.name} <${user.email}> ${Math.floor(new Date(when).getTime() / 1000)} +0000\n\n${subject}\n`;
@@ -829,6 +938,24 @@ export class GitPostStore extends DurableObject<Env> {
     );
     const sha = await this.commit(id, user, subject, body || "", story, ts, "");
     this.recordEvent("commit", id, sha, user.handle);
+    const st = story as any;
+    if (st && st.kind && st.kind !== "link") {
+      const bridge = {
+        url: st.url || storyUrl,
+        provider: st.provider,
+        repo: st.repo,
+        kind: st.kind,
+        number: st.number || "",
+        title: st.title || String(st.message || "").split("\n")[0],
+        state: st.state || "",
+        sha: st.sha || "",
+        htmlUrl: st.htmlUrl || st.url,
+        direction: "code-to-writing",
+        createdBy: user.handle,
+        createdAt: ts,
+      };
+      this.sql("UPDATE posts SET kind = 'story', bridges_json = ? WHERE id = ?", JSON.stringify([bridge]), id);
+    }
     return this.findPost(id)!;
   }
 
@@ -2217,7 +2344,8 @@ export class GitPostStore extends DurableObject<Env> {
         if (draftMatch[2] === "commit" && method === "POST") {
           if (!String(d.subject || "").trim()) return err(400, "bad request");
           this.sql("DELETE FROM drafts WHERE id = ?", d.id);
-          const p = await this.createPost(viewer, d.subject, d.body || "", d.story_url || "", null, parseTopics(d.topics_json));
+          const story = d.story_url ? await fetchStory(d.story_url) : null;
+          const p = await this.createPost(viewer, d.subject, d.body || "", d.story_url || "", story, parseTopics(d.topics_json));
           return json({ post: this.postPayload(p, viewer) }, 201);
         }
         if (method === "GET") {
@@ -2241,6 +2369,97 @@ export class GitPostStore extends DurableObject<Env> {
           this.sql("DELETE FROM drafts WHERE id = ?", d.id);
           return json({ ok: true });
         }
+      }
+
+      const postBridge = path.match(/^\/api\/posts\/([^/]+)\/bridges$/);
+      if (postBridge) {
+        if (!viewer) return err(401, "unauthorized");
+        const p = this.findPost(decodeURIComponent(postBridge[1]));
+        if (!p) return err(404, "not found");
+        if (!canPushPost(p, viewer)) return err(403, "forbidden");
+        if (method === "POST") {
+          const inb = await req.json<any>();
+          const st = await fetchStory(String(inb.url || ""));
+          if (!st) return err(400, "bad request");
+          const list = parseReviews(p.bridges_json);
+          const bridge = {
+            url: st.url,
+            provider: st.provider,
+            repo: st.repo,
+            kind: st.kind,
+            number: st.number || "",
+            title: st.title || String(st.message || "").split("\n")[0],
+            state: st.state || "",
+            sha: st.sha || "",
+            htmlUrl: st.htmlUrl || st.url,
+            direction: inb.direction || "writing-to-code",
+            createdBy: viewer.handle,
+            createdAt: new Date().toISOString(),
+          };
+          if (!list.some((b: any) => b.url === bridge.url)) list.push(bridge);
+          this.sql("UPDATE posts SET bridges_json = ?, updated_at = ? WHERE id = ?", JSON.stringify(list), new Date().toISOString(), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+        if (method === "DELETE") {
+          const raw = url.searchParams.get("url") || "";
+          const list = parseReviews(p.bridges_json).filter((b: any) => b.url !== raw && b.htmlUrl !== raw);
+          this.sql("UPDATE posts SET bridges_json = ? WHERE id = ?", JSON.stringify(list), p.id);
+          return json({ post: this.postPayload(this.findPost(p.id), viewer) });
+        }
+      }
+
+      if (path === "/api/watches" && method === "GET") {
+        if (!viewer) return err(401, "unauthorized");
+        return json({ watches: this.listWatches(viewer.handle) });
+      }
+      if (path === "/api/watches" && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        const w = this.watchRepo(viewer.handle, String(inb.repo || ""));
+        if (!w) return err(400, "bad request");
+        return json({ watch: w, watches: this.listWatches(viewer.handle) });
+      }
+      if (path === "/api/watches" && method === "DELETE") {
+        if (!viewer) return err(401, "unauthorized");
+        this.unwatchRepo(viewer.handle, url.searchParams.get("repo") || "");
+        return json({ watches: this.listWatches(viewer.handle) });
+      }
+
+      if (path === "/api/changelog" && method === "GET") {
+        if (!viewer) return err(401, "unauthorized");
+        const hints = await this.refreshChangelog(viewer.handle);
+        return json({ hints, watches: this.listWatches(viewer.handle) });
+      }
+      if (path === "/api/changelog/from-url" && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        const st = await fetchStory(String(inb.url || ""));
+        if (!st || (st.kind !== "release" && st.kind !== "commit" && st.kind !== "pull" && !String(inb.url || "").includes("/releases/"))) {
+          return err(400, "bad request");
+        }
+        const tag = st.number || st.sha || "ship";
+        const name = st.title || String(st.message || "").split("\n")[0];
+        const existing = this.one<any>("SELECT * FROM hints WHERE handle = ? AND html_url = ?", viewer.handle, st.htmlUrl || st.url);
+        if (!existing) {
+          this.sql(
+            "INSERT INTO hints (id, handle, repo, tag, name, body, html_url, published_at, dismissed, draft_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', ?)",
+            hex(5), viewer.handle, st.repo || "", tag, name, st.message || "", st.htmlUrl || st.url, st.date || "", new Date().toISOString(),
+          );
+        }
+        return json({ hints: this.hintsFor(viewer.handle) }, 201);
+      }
+      const chDraft = path.match(/^\/api\/changelog\/([^/]+)\/draft$/);
+      if (chDraft && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const d = this.draftFromHint(viewer.handle, chDraft[1]);
+        if (!d) return err(404, "not found");
+        return json({ draft: d }, 201);
+      }
+      const chDismiss = path.match(/^\/api\/changelog\/([^/]+)\/dismiss$/);
+      if (chDismiss && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        this.sql("UPDATE hints SET dismissed = 1 WHERE id = ? AND handle = ?", chDismiss[1], viewer.handle);
+        return json({ hints: this.hintsFor(viewer.handle) });
       }
 
       if (path === "/api/story/preview" && method === "GET") {
@@ -2340,63 +2559,100 @@ function applyParagraph(body: string, index: number, original: string, proposed:
   throw new Error("not found");
 }
 
-async function fetchStory(rawURL: string) {
+async function fetchStory(rawURL: string): Promise<any | null> {
   rawURL = (rawURL || "").trim();
   if (!rawURL) return null;
   const ghCommit = rawURL.match(/github\.com\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})/i);
   const ghPR = rawURL.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/i);
-  const gl = rawURL.match(/gitlab\.com\/(.+)\/-\/commit\/([0-9a-f]{7,40})/i);
-  if (gl) return { url: rawURL, provider: "gitlab", repo: gl[1], sha: gl[2], htmlUrl: rawURL, message: "GitLab commit" };
+  const ghIssue = rawURL.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/i);
+  const ghRel = rawURL.match(/github\.com\/([^/]+)\/([^/]+)\/releases\/tag\/([^/?#]+)/i);
+  const glC = rawURL.match(/gitlab\.com\/(.+)\/-\/commit\/([0-9a-f]{7,40})/i);
+  const glMR = rawURL.match(/gitlab\.com\/(.+)\/-\/merge_requests\/(\d+)/i);
+  const glI = rawURL.match(/gitlab\.com\/(.+)\/-\/issues\/(\d+)/i);
+  const headers = { Accept: "application/vnd.github+json", "User-Agent": "gitpo.st" };
   try {
     if (ghCommit) {
       const owner = ghCommit[1];
       const repo = ghCommit[2].replace(/\.git$/, "");
       const sha = ghCommit[3];
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${sha}`, {
-        headers: { Accept: "application/vnd.github+json", "User-Agent": "gitpo.st" },
-      });
-      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, sha, htmlUrl: rawURL, message: "Could not fetch commit — saved the link." };
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${sha}`, { headers });
+      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, sha, htmlUrl: rawURL, kind: "commit", message: "Could not fetch commit — saved the link." };
       const payload: any = await res.json();
-      const snippet = payload.files?.[0]?.patch?.slice(0, 4000) || "";
+      const files = (payload.files || []).slice(0, 4).map((f: any) => ({ filename: f.filename, additions: f.additions, deletions: f.deletions }));
+      let snippet = "";
+      for (const f of (payload.files || []).slice(0, 4)) {
+        if (!f.patch) continue;
+        snippet += `diff --git a/${f.filename} b/${f.filename}\n${f.patch}\n`;
+      }
       return {
-        url: rawURL,
-        provider: "github",
-        repo: `${owner}/${repo}`,
-        sha: payload.sha,
-        message: payload.commit?.message,
-        author: payload.commit?.author?.name,
-        date: payload.commit?.author?.date,
-        htmlUrl: payload.html_url,
-        additions: payload.stats?.additions || 0,
-        deletions: payload.stats?.deletions || 0,
-        snippet,
+        url: rawURL, provider: "github", repo: `${owner}/${repo}`, sha: payload.sha, kind: "commit",
+        title: String(payload.commit?.message || "").split("\n")[0],
+        message: payload.commit?.message, author: payload.commit?.author?.name, date: payload.commit?.author?.date,
+        htmlUrl: payload.html_url, additions: payload.stats?.additions || 0, deletions: payload.stats?.deletions || 0,
+        snippet: snippet.slice(0, 8000), files,
       };
     }
     if (ghPR) {
       const owner = ghPR[1];
       const repo = ghPR[2].replace(/\.git$/, "");
       const num = ghPR[3];
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}`, {
-        headers: { Accept: "application/vnd.github+json", "User-Agent": "gitpo.st" },
-      });
-      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, htmlUrl: rawURL, message: "Pull request " + num };
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}`, { headers });
+      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, htmlUrl: rawURL, kind: "pull", number: num, message: "Pull request " + num };
       const payload: any = await res.json();
+      let snippet = "";
+      const files: any[] = [];
+      try {
+        const fr = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}/files?per_page=10`, { headers });
+        if (fr.ok) {
+          const fl: any[] = await fr.json();
+          for (const f of fl.slice(0, 4)) {
+            files.push({ filename: f.filename, additions: f.additions, deletions: f.deletions });
+            if (f.patch) snippet += `diff --git a/${f.filename} b/${f.filename}\n${f.patch}\n`;
+          }
+        }
+      } catch { /* ignore */ }
       return {
-        url: rawURL,
-        provider: "github",
-        repo: `${owner}/${repo}`,
-        sha: payload.head?.sha,
-        message: `${payload.title}\n\n${payload.body || ""}`,
-        author: payload.user?.login,
-        htmlUrl: payload.html_url,
-        additions: payload.additions,
-        deletions: payload.deletions,
+        url: rawURL, provider: "github", repo: `${owner}/${repo}`, sha: payload.head?.sha, kind: "pull", number: num,
+        title: payload.title, state: payload.merged ? "merged" : payload.state,
+        message: `${payload.title}\n\n${payload.body || ""}`, author: payload.user?.login, htmlUrl: payload.html_url,
+        additions: payload.additions, deletions: payload.deletions, snippet: snippet.slice(0, 8000), files,
       };
     }
+    if (ghIssue) {
+      const owner = ghIssue[1];
+      const repo = ghIssue[2].replace(/\.git$/, "");
+      const num = ghIssue[3];
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues/${num}`, { headers });
+      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, htmlUrl: rawURL, kind: "issue", number: num, message: "Issue " + num };
+      const payload: any = await res.json();
+      if (payload.pull_request) return fetchStory(payload.pull_request.html_url || rawURL.replace("/issues/", "/pull/"));
+      return {
+        url: rawURL, provider: "github", repo: `${owner}/${repo}`, kind: "issue", number: num,
+        title: payload.title, state: payload.state, message: `${payload.title}\n\n${payload.body || ""}`,
+        author: payload.user?.login, htmlUrl: payload.html_url,
+      };
+    }
+    if (ghRel) {
+      const owner = ghRel[1];
+      const repo = ghRel[2].replace(/\.git$/, "");
+      const tag = decodeURIComponent(ghRel[3]);
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers });
+      if (!res.ok) return { url: rawURL, provider: "github", repo: `${owner}/${repo}`, kind: "release", title: tag, message: tag, htmlUrl: rawURL };
+      const payload: any = await res.json();
+      return {
+        url: rawURL, provider: "github", repo: `${owner}/${repo}`, kind: "release",
+        title: payload.name || payload.tag_name, number: payload.tag_name, state: "published",
+        message: `${payload.name || payload.tag_name}\n\n${payload.body || ""}`,
+        author: payload.author?.login, date: payload.published_at, htmlUrl: payload.html_url,
+      };
+    }
+    if (glC) return { url: rawURL, provider: "gitlab", repo: glC[1], sha: glC[2], htmlUrl: rawURL, kind: "commit", message: "GitLab commit" };
+    if (glMR) return { url: rawURL, provider: "gitlab", repo: glMR[1], number: glMR[2], htmlUrl: rawURL, kind: "pull", message: "Merge request " + glMR[2] };
+    if (glI) return { url: rawURL, provider: "gitlab", repo: glI[1], number: glI[2], htmlUrl: rawURL, kind: "issue", message: "Issue " + glI[2] };
   } catch {
     /* fall through */
   }
-  return { url: rawURL, provider: "link", htmlUrl: rawURL, message: rawURL };
+  return { url: rawURL, provider: "link", htmlUrl: rawURL, kind: "link", message: rawURL };
 }
 
 export default {

@@ -206,6 +206,8 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"forkIntentNote": p.ForkIntentNote,
 		"storyUrl":      p.StoryURL,
 		"story":         p.Story,
+		"kind":          p.Kind,
+		"bridges":       p.Bridges,
 		"starCount":     len(p.Stars),
 		"watchCount":    len(p.Watchers),
 		"stars":         p.Stars,
@@ -1133,6 +1135,138 @@ func (s *Server) handleStoryPreview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "gitpo.st", "time": time.Now().UTC()})
+}
+
+func (s *Server) handleAttachBridge(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		URL       string `json:"url"`
+		Direction string `json:"direction"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	p, err := s.store.AttachBridge(r.PathValue("id"), in.URL, in.Direction, u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleDetachBridge(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	p, err := s.store.DetachBridge(r.PathValue("id"), r.URL.Query().Get("url"), u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"post": postPayload(p, u)})
+}
+
+func (s *Server) handleListWatches(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"watches": s.store.ListWatches(u.Handle)})
+}
+
+func (s *Server) handleWatchRepo(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Repo string `json:"repo"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	wch, err := s.store.WatchRepo(u.Handle, in.Repo)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"watch": wch, "watches": s.store.ListWatches(u.Handle)})
+}
+
+func (s *Server) handleUnwatchRepo(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	repo := r.URL.Query().Get("repo")
+	if repo == "" {
+		repo = r.PathValue("repo")
+	}
+	if err := s.store.UnwatchRepo(u.Handle, repo); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"watches": s.store.ListWatches(u.Handle)})
+}
+
+func (s *Server) handleChangelog(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	hints := s.store.RefreshChangelog(u.Handle)
+	writeJSON(w, 200, map[string]any{"hints": hints, "watches": s.store.ListWatches(u.Handle)})
+}
+
+func (s *Server) handleChangelogFromURL(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		URL string `json:"url"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	h, err := s.store.HintFromURL(u.Handle, in.URL)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"hint": h, "hints": s.store.HintsFor(u.Handle)})
+}
+
+func (s *Server) handleChangelogDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	d, err := s.store.DraftFromHint(u.Handle, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"draft": d})
+}
+
+func (s *Server) handleChangelogDismiss(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	if err := s.store.DismissHint(u.Handle, r.PathValue("id")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"hints": s.store.HintsFor(u.Handle)})
 }
 
 func (s *Server) handleDerived(w http.ResponseWriter, r *http.Request) {

@@ -7,9 +7,11 @@
         <NuxtLink to="/explore">explore</NuxtLink>
         <NuxtLink to="/pulls">pulls</NuxtLink>
         <NuxtLink v-if="user" to="/drafts">drafts</NuxtLink>
+        <NuxtLink v-if="user" to="/changelog">ship</NuxtLink>
         <NuxtLink v-if="user?.isAdmin" to="/admin">admin</NuxtLink>
       </nav>
       <div class="header-actions">
+        <NuxtLink v-if="user" to="/compose?mode=story" class="btn btn-sm">Story</NuxtLink>
         <NuxtLink v-if="user" to="/compose" class="btn btn-primary btn-sm">Commit</NuxtLink>
         <NuxtLink v-else to="/login" class="btn btn-primary btn-sm">Sign in</NuxtLink>
         <NuxtLink v-if="user" to="/inbox" class="btn btn-ghost btn-sm inbox-link">

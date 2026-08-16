@@ -1866,3 +1866,43 @@ html.wysimark-on {
 .invite-row.unread {
   background: var(--bg-subtle);
 }
+
+.mode-switch {
+  display: flex;
+  gap: 0;
+  margin: 0 0 var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  width: fit-content;
+}
+
+.mode-switch button {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 0;
+  padding: 8px 14px;
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.mode-switch button.on {
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+
+.story-files {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.story-files li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  color: var(--fg-muted);
+}
