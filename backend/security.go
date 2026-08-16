@@ -80,6 +80,7 @@ func (u User) Public() map[string]any {
 		"isAdmin":      u.IsAdmin(),
 		"isSuperAdmin": u.IsSuper(),
 		"createdAt":    u.CreatedAt,
+		"quietDerived": u.QuietDerived,
 	}
 }
 

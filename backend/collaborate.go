@@ -61,6 +61,10 @@ func (s *Store) CherryPickExcerpt(destID, sourceID, excerpt string, user *User) 
 			return nil, err
 		}
 		s.mu.Lock()
+		if np := s.posts[p.ID]; np != nil {
+			s.attachDerived(np, src, "cherry", user.Handle, src.HeadSHA)
+			s.notifyDerivedLocked(src, np, "cherry", user.Handle, src.HeadSHA)
+		}
 		s.recordLocked("cherry", p.ID, p.HeadSHA, user.Handle)
 		s.recordLocked("cherry", src.ID, src.HeadSHA, user.Handle)
 		_ = s.save()
@@ -95,6 +99,8 @@ func (s *Store) CherryPickExcerpt(destID, sourceID, excerpt string, user *User) 
 	dst.CommitCount = s.commitCount(dst.ID)
 	s.recordLocked("cherry", dst.ID, sha, user.Handle)
 	s.recordLocked("cherry", src.ID, src.HeadSHA, user.Handle)
+	s.attachDerived(dst, src, "cherry", user.Handle, src.HeadSHA)
+	s.notifyDerivedLocked(src, dst, "cherry", user.Handle, src.HeadSHA)
 	return dst, s.save()
 }
 

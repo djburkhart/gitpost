@@ -175,7 +175,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"user": nil})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"user": u.Public()})
+	writeJSON(w, 200, map[string]any{"user": u.Public(), "unread": s.store.UnreadCount(u.Handle)})
 }
 
 func postPayload(p *Post, viewer *User) map[string]any {
@@ -227,6 +227,7 @@ func postPayload(p *Post, viewer *User) map[string]any {
 		"invited":       viewer != nil && containsHandle(p.CoAuthorInvites, viewer.Handle),
 		"verified":      p.Verified,
 		"genesis":       p.Genesis,
+		"derivedFrom":   p.DerivedFrom,
 	}
 }
 
@@ -769,7 +770,23 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		delete(item, "body")
 		items = append(items, item)
 	}
-	writeJSON(w, 200, map[string]any{"user": u.Public(), "posts": items})
+	derived := []map[string]any{}
+	for i := range posts {
+		for _, row := range s.store.DerivationsFrom(posts[i].ID) {
+			derived = append(derived, row)
+		}
+	}
+	pub := u.Public()
+	if viewer == nil || !strings.EqualFold(viewer.Handle, u.Handle) {
+		delete(pub, "email")
+	}
+	writeJSON(w, 200, map[string]any{
+		"user":    pub,
+		"posts":   items,
+		"graph":   s.store.Contribution(handle),
+		"score":   s.store.Score(handle),
+		"derived": derived,
+	})
 }
 
 func (s *Server) handleCherryPickExcerpt(w http.ResponseWriter, r *http.Request) {
@@ -1116,6 +1133,154 @@ func (s *Server) handleStoryPreview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "gitpo.st", "time": time.Now().UTC()})
+}
+
+func (s *Server) handleDerived(w http.ResponseWriter, r *http.Request) {
+	p := s.store.FindPost(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"derived": s.store.DerivationsFrom(p.ID)})
+}
+
+func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"notices": s.store.Inbox(u.Handle), "unread": s.store.UnreadCount(u.Handle)})
+}
+
+func (s *Server) handleInboxRead(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		IDs []string `json:"ids"`
+		All bool     `json:"all"`
+	}
+	_ = readJSON(r, &in)
+	if err := s.store.MarkInbox(u.Handle, in.IDs, in.All); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"notices": s.store.Inbox(u.Handle), "unread": s.store.UnreadCount(u.Handle)})
+}
+
+func (s *Server) handlePrefs(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		QuietDerived *bool `json:"quietDerived"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	if in.QuietDerived != nil {
+		if err := s.store.SetQuietDerived(u.Handle, *in.QuietDerived); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+	u = s.store.UserByHandle(u.Handle)
+	writeJSON(w, 200, map[string]any{"user": u.Public()})
+}
+
+func (s *Server) handleListDrafts(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"drafts": s.store.ListDrafts(u.Handle)})
+}
+
+func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Subject  string   `json:"subject"`
+		Body     string   `json:"body"`
+		StoryURL string   `json:"storyUrl"`
+		Topics   []string `json:"topics"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	d, err := s.store.SaveDraft("", u.Handle, in.Subject, in.Body, in.StoryURL, in.Topics)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"draft": d})
+}
+
+func (s *Server) handleGetDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	d := s.store.GetDraft(r.PathValue("id"), u.Handle)
+	if d == nil {
+		writeErr(w, errNotFound)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"draft": d})
+}
+
+func (s *Server) handleUpdateDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	var in struct {
+		Subject  string   `json:"subject"`
+		Body     string   `json:"body"`
+		StoryURL string   `json:"storyUrl"`
+		Topics   []string `json:"topics"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, errBadRequest)
+		return
+	}
+	d, err := s.store.SaveDraft(r.PathValue("id"), u.Handle, in.Subject, in.Body, in.StoryURL, in.Topics)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"draft": d})
+}
+
+func (s *Server) handleDeleteDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	if err := s.store.DeleteDraft(r.PathValue("id"), u.Handle); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCommitDraft(w http.ResponseWriter, r *http.Request) {
+	u := s.requireUser(w, r)
+	if u == nil {
+		return
+	}
+	p, err := s.store.CommitDraft(r.PathValue("id"), u)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"post": postPayload(p, u)})
 }
 
 func (s *Server) handleStats(_ http.ResponseWriter, _ *http.Request) {}

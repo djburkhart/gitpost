@@ -392,6 +392,28 @@ export class GitPostStore extends DurableObject<Env> {
         branch TEXT,
         created_at TEXT
       )`,
+      `CREATE TABLE IF NOT EXISTS drafts (
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        subject TEXT,
+        body TEXT,
+        story_url TEXT,
+        topics_json TEXT,
+        created_at TEXT,
+        updated_at TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS notices (
+        id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        kind TEXT,
+        actor TEXT,
+        post_id TEXT,
+        source_post_id TEXT,
+        sha TEXT,
+        subject TEXT,
+        read INTEGER,
+        created_at TEXT
+      )`,
       `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`,
     ];
     for (const stmt of statements) {
@@ -417,6 +439,8 @@ export class GitPostStore extends DurableObject<Env> {
       "ALTER TABLE prs ADD COLUMN reviewers_json TEXT",
       "ALTER TABLE prs ADD COLUMN conflict_body TEXT",
       "ALTER TABLE commits ADD COLUMN trailers TEXT",
+      "ALTER TABLE posts ADD COLUMN derived_json TEXT",
+      "ALTER TABLE users ADD COLUMN quiet_derived INTEGER",
     ]) {
       try {
         this.ctx.storage.sql.exec(extra);
@@ -513,6 +537,7 @@ export class GitPostStore extends DurableObject<Env> {
       isAdmin: role === "admin" || role === "superadmin",
       isSuperAdmin: role === "superadmin",
       createdAt: u.created_at,
+      quietDerived: !!(u as any).quiet_derived,
     };
   }
 
@@ -584,6 +609,7 @@ export class GitPostStore extends DurableObject<Env> {
       invited: !!(viewer && parseTopics(p.invites_json).includes(viewer.handle)),
       verified: this.verifyHistory(p.id).verified,
       genesis: this.verifyHistory(p.id).genesis,
+      derivedFrom: parseReviews(p.derived_json),
     };
   }
 
@@ -622,6 +648,133 @@ export class GitPostStore extends DurableObject<Env> {
       actor,
       new Date().toISOString(),
     );
+  }
+
+  private attachDerived(destId: string, src: any, kind: string, actor: string, sha: string) {
+    const dest = this.findPost(destId);
+    if (!dest) return;
+    const list = parseReviews(dest.derived_json);
+    list.push({
+      kind,
+      sourcePostId: src.id,
+      sourceSha: sha,
+      sourceOwner: src.owner,
+      sourceSubject: src.subject,
+      actor,
+      createdAt: new Date().toISOString(),
+    });
+    this.sql("UPDATE posts SET derived_json = ? WHERE id = ?", JSON.stringify(list), destId);
+  }
+
+  private notifyDerived(src: any, dest: any, kind: string, actor: string, sha: string) {
+    if (!src || !dest || src.owner === actor) return;
+    const u = this.one<any>("SELECT * FROM users WHERE handle = ?", String(src.owner).toLowerCase());
+    if (u?.quiet_derived) return;
+    this.sql(
+      "INSERT INTO notices (id, handle, kind, actor, post_id, source_post_id, sha, subject, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      hex(6),
+      src.owner,
+      kind,
+      actor,
+      dest.id,
+      src.id,
+      sha || "",
+      dest.subject || "",
+      new Date().toISOString(),
+    );
+  }
+
+  private unreadCount(handle: string) {
+    return this.sql<any>("SELECT id FROM notices WHERE handle = ? AND read = 0", handle).length;
+  }
+
+  private contribution(handle: string) {
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const weekday = today.getUTCDay();
+    const end = new Date(today);
+    const start = new Date(today);
+    start.setUTCDate(start.getUTCDate() - (52 * 7 + weekday));
+    const cells = new Map<string, any>();
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+      const key = d.toISOString().slice(0, 10);
+      cells.set(key, { date: key, commits: 0, merges: 0, taken: 0, total: 0, level: 0 });
+    }
+    const events = this.sql<any>("SELECT * FROM events");
+    for (const ev of events) {
+      const key = String(ev.created_at || "").slice(0, 10);
+      const cell = cells.get(key);
+      if (!cell) continue;
+      const p = this.findPost(ev.post_id);
+      if ((ev.kind === "commit" || ev.kind === "revert") && ev.actor === handle) cell.commits++;
+      if (ev.kind === "merge" && p && p.owner === handle) cell.merges++;
+      if (ev.kind === "cherry" && p && p.owner === handle && ev.actor !== handle) cell.taken++;
+    }
+    const weeks: any[][] = [];
+    let week: any[] = [];
+    const totals = { commits: 0, merges: 0, taken: 0 };
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+      const c = cells.get(d.toISOString().slice(0, 10))!;
+      c.total = c.commits + c.merges + c.taken;
+      c.level = c.total <= 0 ? 0 : c.total === 1 ? 1 : c.total <= 3 ? 2 : c.total <= 6 ? 3 : 4;
+      totals.commits += c.commits;
+      totals.merges += c.merges;
+      totals.taken += c.taken;
+      week.push(c);
+      if (week.length === 7) {
+        weeks.push(week);
+        week = [];
+      }
+    }
+    if (week.length) weeks.push(week);
+    return { weeks, start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), totals };
+  }
+
+  private score(handle: string) {
+    let reviews = 0;
+    for (const pr of this.sql<any>("SELECT reviewers_json FROM prs")) {
+      for (const r of parseReviews(pr.reviewers_json)) {
+        if (r.handle === handle && r.status && r.status !== "pending") reviews++;
+      }
+    }
+    let mergesAccepted = 0;
+    let taken = 0;
+    for (const ev of this.sql<any>("SELECT * FROM events")) {
+      const p = this.findPost(ev.post_id);
+      if (ev.kind === "merge" && p && p.owner === handle) mergesAccepted++;
+      if (ev.kind === "cherry" && p && p.owner === handle && ev.actor !== handle) taken++;
+    }
+    let qualityMain = 0;
+    let starsMaintained = 0;
+    for (const p of this.sql<any>("SELECT * FROM posts")) {
+      const maintainers = parseTopics(p.maintainers_json);
+      if (p.owner !== handle && !maintainers.includes(handle)) continue;
+      starsMaintained += this.sql<any>("SELECT user FROM stars WHERE post_id = ?", p.id).length;
+      if (p.protected) qualityMain += 3;
+      const commits = this.sql<any>("SELECT sha FROM commits WHERE post_id = ?", p.id).length;
+      if (commits >= 3) qualityMain += 1;
+      if (this.verifyHistory(p.id).verified) qualityMain += 2;
+    }
+    const score = reviews * 3 + mergesAccepted * 5 + taken * 2 + qualityMain + starsMaintained;
+    return { score, reviews, mergesAccepted, taken, qualityMain, starsMaintained };
+  }
+
+  private derivationsFrom(id: string) {
+    const out: any[] = [];
+    const seen = new Set<string>();
+    for (const p of this.sql<any>("SELECT * FROM posts")) {
+      if (p.parent_post_id === id && !seen.has(p.id)) {
+        seen.add(p.id);
+        out.push({ kind: "fork", id: p.id, subject: p.subject, owner: p.owner, sha: p.head_sha, intent: p.fork_intent, updatedAt: p.updated_at });
+      }
+      for (const a of parseReviews(p.derived_json)) {
+        if (a.sourcePostId === id && !seen.has(p.id)) {
+          seen.add(p.id);
+          out.push({ kind: a.kind, id: p.id, subject: p.subject, owner: p.owner, sha: p.head_sha, updatedAt: a.createdAt });
+        }
+      }
+    }
+    return out;
   }
 
   private async commit(postId: string, user: User, subject: string, body: string, story: unknown, when: string, parentSha: string, branch = "main") {
@@ -739,7 +892,10 @@ export class GitPostStore extends DurableObject<Env> {
     this.sql("UPDATE posts SET head_sha = ? WHERE id = ?", forkSha, nid);
     this.recordEvent("fork", src.id, src.head_sha, user.handle);
     this.recordEvent("fork", nid, forkSha, user.handle);
-    return this.findPost(nid)!;
+    const dest = this.findPost(nid)!;
+    this.attachDerived(nid, src, "fork", user.handle, src.head_sha);
+    this.notifyDerived(src, dest, "fork", user.handle, src.head_sha);
+    return dest;
   }
 
   private async openPR(
@@ -1178,7 +1334,7 @@ export class GitPostStore extends DurableObject<Env> {
       }
 
       if (path === "/api/auth/me" && method === "GET") {
-        return json({ user: viewer ? this.publicUser(viewer) : null });
+        return json({ user: viewer ? this.publicUser(viewer) : null, unread: viewer ? this.unreadCount(viewer.handle) : 0 });
       }
 
       if (path === "/api/auth/config" && method === "GET") {
@@ -1558,7 +1714,9 @@ export class GitPostStore extends DurableObject<Env> {
             const created = await this.createPost(viewer, subject, attr, "", null, parseTopics(p.topics_json));
             this.recordEvent("cherry", created.id, created.head_sha, viewer.handle);
             this.recordEvent("cherry", p.id, p.head_sha, viewer.handle);
-            return json({ post: this.postPayload(created, viewer) }, 201);
+            this.attachDerived(created.id, p, "cherry", viewer.handle, p.head_sha);
+            this.notifyDerived(p, created, "cherry", viewer.handle, p.head_sha);
+            return json({ post: this.postPayload(this.findPost(created.id), viewer) }, 201);
           }
           const dest = this.findPost(inb.destId);
           if (!dest) return err(404, "not found");
@@ -1567,7 +1725,9 @@ export class GitPostStore extends DurableObject<Env> {
           const np = await this.amendPost(dest.id, viewer, dest.subject, body, dest.story_json ? JSON.parse(dest.story_json) : null);
           this.recordEvent("cherry", dest.id, np.head_sha, viewer.handle);
           this.recordEvent("cherry", p.id, p.head_sha, viewer.handle);
-          return json({ post: this.postPayload(np, viewer) }, 201);
+          this.attachDerived(dest.id, p, "cherry", viewer.handle, p.head_sha);
+          this.notifyDerived(p, this.findPost(dest.id), "cherry", viewer.handle, p.head_sha);
+          return json({ post: this.postPayload(this.findPost(dest.id), viewer) }, 201);
         }
 
         if (rest === "comments" && method === "GET") {
@@ -1952,7 +2112,135 @@ export class GitPostStore extends DurableObject<Env> {
           delete (item as any).body;
           return item;
         });
-        return json({ user: this.publicUser(u), posts });
+        const derived: any[] = [];
+        for (const p of this.sql<any>("SELECT id FROM posts WHERE owner = ?", u.handle)) {
+          derived.push(...this.derivationsFrom(p.id));
+        }
+        const pub: any = this.publicUser(u);
+        if (!viewer || viewer.handle !== u.handle) delete pub.email;
+        return json({ user: pub, posts, graph: this.contribution(u.handle), score: this.score(u.handle), derived });
+      }
+
+      if (path.match(/^\/api\/posts\/[^/]+\/derived$/) && method === "GET") {
+        const id = decodeURIComponent(path.split("/")[3]);
+        const p = this.findPost(id);
+        if (!p) return err(404, "not found");
+        return json({ derived: this.derivationsFrom(p.id) });
+      }
+
+      if (path === "/api/inbox" && method === "GET") {
+        if (!viewer) return err(401, "unauthorized");
+        const notices = this.sql<any>("SELECT * FROM notices WHERE handle = ? ORDER BY created_at DESC LIMIT 80", viewer.handle).map((n) => ({
+          id: n.id,
+          handle: n.handle,
+          kind: n.kind,
+          actor: n.actor,
+          postId: n.post_id,
+          sourcePostId: n.source_post_id,
+          sha: n.sha,
+          subject: n.subject,
+          read: !!n.read,
+          createdAt: n.created_at,
+        }));
+        return json({ notices, unread: this.unreadCount(viewer.handle) });
+      }
+
+      if (path === "/api/inbox/read" && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        if (inb.all) {
+          this.sql("UPDATE notices SET read = 1 WHERE handle = ?", viewer.handle);
+        } else {
+          for (const id of inb.ids || []) {
+            this.sql("UPDATE notices SET read = 1 WHERE id = ? AND handle = ?", id, viewer.handle);
+          }
+        }
+        const notices = this.sql<any>("SELECT * FROM notices WHERE handle = ? ORDER BY created_at DESC LIMIT 80", viewer.handle);
+        return json({ notices, unread: this.unreadCount(viewer.handle) });
+      }
+
+      if (path === "/api/me/prefs" && method === "PUT") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        if (typeof inb.quietDerived === "boolean") {
+          this.sql("UPDATE users SET quiet_derived = ? WHERE handle = ?", inb.quietDerived ? 1 : 0, viewer.handle);
+        }
+        const u = this.one<User>("SELECT * FROM users WHERE handle = ?", viewer.handle);
+        return json({ user: u ? this.publicUser(u) : null });
+      }
+
+      if (path === "/api/drafts" && method === "GET") {
+        if (!viewer) return err(401, "unauthorized");
+        const drafts = this.sql<any>("SELECT * FROM drafts WHERE owner = ? ORDER BY updated_at DESC", viewer.handle).map((d) => ({
+          id: d.id,
+          owner: d.owner,
+          subject: d.subject,
+          body: d.body,
+          storyUrl: d.story_url,
+          topics: parseTopics(d.topics_json),
+          createdAt: d.created_at,
+          updatedAt: d.updated_at,
+        }));
+        return json({ drafts });
+      }
+
+      if (path === "/api/drafts" && method === "POST") {
+        if (!viewer) return err(401, "unauthorized");
+        const inb = await req.json<any>();
+        const subject = String(inb.subject || "").trim();
+        const body = String(inb.body || "");
+        if (!subject && !body.trim()) return err(400, "bad request");
+        const n = this.sql<any>("SELECT id FROM drafts WHERE owner = ?", viewer.handle).length;
+        if (n >= 40) return err(400, "bad request");
+        const id = hex(5);
+        const ts = new Date().toISOString();
+        this.sql(
+          "INSERT INTO drafts (id, owner, subject, body, story_url, topics_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          id,
+          viewer.handle,
+          subject,
+          body,
+          inb.storyUrl || "",
+          JSON.stringify(inb.topics || []),
+          ts,
+          ts,
+        );
+        const d = this.one<any>("SELECT * FROM drafts WHERE id = ?", id);
+        return json({ draft: { id: d.id, owner: d.owner, subject: d.subject, body: d.body, storyUrl: d.story_url, topics: parseTopics(d.topics_json), createdAt: d.created_at, updatedAt: d.updated_at } }, 201);
+      }
+
+      const draftMatch = path.match(/^\/api\/drafts\/([^/]+)(?:\/(commit))?$/);
+      if (draftMatch) {
+        if (!viewer) return err(401, "unauthorized");
+        const d = this.one<any>("SELECT * FROM drafts WHERE id = ? AND owner = ?", draftMatch[1], viewer.handle);
+        if (!d) return err(404, "not found");
+        if (draftMatch[2] === "commit" && method === "POST") {
+          if (!String(d.subject || "").trim()) return err(400, "bad request");
+          this.sql("DELETE FROM drafts WHERE id = ?", d.id);
+          const p = await this.createPost(viewer, d.subject, d.body || "", d.story_url || "", null, parseTopics(d.topics_json));
+          return json({ post: this.postPayload(p, viewer) }, 201);
+        }
+        if (method === "GET") {
+          return json({ draft: { id: d.id, owner: d.owner, subject: d.subject, body: d.body, storyUrl: d.story_url, topics: parseTopics(d.topics_json), createdAt: d.created_at, updatedAt: d.updated_at } });
+        }
+        if (method === "PUT") {
+          const inb = await req.json<any>();
+          this.sql(
+            "UPDATE drafts SET subject = ?, body = ?, story_url = ?, topics_json = ?, updated_at = ? WHERE id = ?",
+            String(inb.subject || "").trim(),
+            String(inb.body || ""),
+            inb.storyUrl || "",
+            JSON.stringify(inb.topics || []),
+            new Date().toISOString(),
+            d.id,
+          );
+          const nd = this.one<any>("SELECT * FROM drafts WHERE id = ?", d.id);
+          return json({ draft: { id: nd.id, owner: nd.owner, subject: nd.subject, body: nd.body, storyUrl: nd.story_url, topics: parseTopics(nd.topics_json), createdAt: nd.created_at, updatedAt: nd.updated_at } });
+        }
+        if (method === "DELETE") {
+          this.sql("DELETE FROM drafts WHERE id = ?", d.id);
+          return json({ ok: true });
+        }
       }
 
       if (path === "/api/story/preview" && method === "GET") {

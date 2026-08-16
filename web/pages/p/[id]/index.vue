@@ -35,6 +35,29 @@
         <NuxtLink v-for="h in post.coAuthors || []" :key="h" :to="`/u/${h}`" class="pill">@{{ h }}</NuxtLink>
         <span v-if="post.protected" class="pill">protected</span>
       </div>
+      <div v-if="post.derivedFrom?.length || post.parentPostId" class="attr-block">
+        <p class="kicker" style="margin: 0 0 8px">derived from</p>
+        <p v-if="post.parentPostId" class="muted" style="margin: 0 0 6px">
+          Fork of
+          <NuxtLink :to="`/p/${post.parentPostId}`">{{ post.parentPostId.slice(0, 8) }}</NuxtLink>
+          <span v-if="post.forkedFromSha"> @ {{ post.forkedFromSha.slice(0, 7) }}</span>
+        </p>
+        <p v-for="(a, i) in post.derivedFrom || []" :key="i" class="muted" style="margin: 0 0 6px">
+          {{ a.kind }}
+          <NuxtLink :to="`/u/${a.sourceOwner}`">@{{ a.sourceOwner }}</NuxtLink>
+          ·
+          <NuxtLink :to="`/p/${a.sourcePostId}`">{{ a.sourceSubject || a.sourcePostId.slice(0, 8) }}</NuxtLink>
+        </p>
+      </div>
+      <div v-if="derived.length" class="attr-block">
+        <p class="kicker" style="margin: 0 0 8px">ideas derived from this</p>
+        <p v-for="d in derived" :key="d.id" class="muted" style="margin: 0 0 6px">
+          <span class="pill">{{ d.kind }}</span>
+          <NuxtLink :to="`/u/${d.owner}`">@{{ d.owner }}</NuxtLink>
+          ·
+          <NuxtLink :to="`/p/${d.id}`">{{ d.subject }}</NuxtLink>
+        </p>
+      </div>
       <div v-if="post.topics?.length" class="topic-row">
         <NuxtLink v-for="t in post.topics" :key="t" :to="`/explore?q=remote:${t}`" class="pill">remote:{{ t }}</NuxtLink>
         <button v-if="user && !followingAll" class="btn btn-ghost btn-sm" type="button" @click="followTopics">Track remotes</button>
@@ -277,6 +300,7 @@ const remotes = ref<string[]>([]);
 const excerpt = ref("");
 const revertSha = ref("");
 const historyProof = ref<any>(null);
+const derived = ref<any[]>([]);
 
 const followingAll = computed(() => {
   const topics: string[] = post.value?.topics || [];
@@ -307,16 +331,18 @@ async function load() {
     post.value = data.post;
     historyProof.value = data.history || null;
     try {
-      const [h, b, p, f] = await Promise.all([
+      const [h, b, p, f, der] = await Promise.all([
         api<{ commits: any[] }>(`/api/posts/${data.post.id}/history`),
         api<{ branches: any[] }>(`/api/posts/${data.post.id}/branches`),
         api<{ prs: any[] }>(`/api/prs?post=${data.post.id}`),
         api<{ forks: any[] }>(`/api/posts/${data.post.id}/forks`),
+        api<{ derived: any[] }>(`/api/posts/${data.post.id}/derived`),
       ]);
       commits.value = h.commits || [];
       branches.value = b.branches || [];
       prs.value = p.prs || [];
       forks.value = f.forks || [];
+      derived.value = der.derived || [];
       if (commits.value.length >= 2) {
         toSha.value = commits.value[0].sha;
         fromSha.value = commits.value[commits.value.length - 1].sha;

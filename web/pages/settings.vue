@@ -11,6 +11,15 @@
       </section>
 
       <section class="card" style="margin-bottom: 24px; max-width: 480px">
+        <p class="kicker">attribution</p>
+        <label class="check-row">
+          <input v-model="quiet" type="checkbox" @change="savePrefs" />
+          <span>Don’t notify me when someone forks or cherry-picks my work. The derived-from link is still written.</span>
+        </label>
+        <p v-if="prefOk" class="subtle">Preference saved.</p>
+      </section>
+
+      <section class="card" style="margin-bottom: 24px; max-width: 480px">
         <p class="kicker">password</p>
         <form @submit.prevent="changePw">
           <div class="field">
@@ -58,15 +67,33 @@ const next = ref("");
 const pwError = ref("");
 const pwOk = ref(false);
 const sessions = ref<any[]>([]);
+const quiet = ref(false);
+const prefOk = ref(false);
 
 onMounted(async () => {
   if (!ready.value) await refresh();
-  if (user.value) await loadSessions();
+  if (user.value) {
+    quiet.value = !!(user.value as any).quietDerived;
+    await loadSessions();
+  }
 });
 
 async function loadSessions() {
   const data = await api<{ sessions: any[] }>("/api/security/sessions");
   sessions.value = data.sessions || [];
+}
+
+async function savePrefs() {
+  prefOk.value = false;
+  const data = await api<{ user: any }>("/api/me/prefs", {
+    method: "PUT",
+    body: JSON.stringify({ quietDerived: quiet.value }),
+  });
+  if (data.user) {
+    user.value = data.user;
+    quiet.value = !!data.user.quietDerived;
+  }
+  prefOk.value = true;
 }
 
 async function changePw() {

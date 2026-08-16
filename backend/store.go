@@ -103,6 +103,7 @@ type User struct {
 	FailedLogins int        `json:"failedLogins"`
 	LockedUntil  *time.Time `json:"lockedUntil,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
+	QuietDerived bool       `json:"quietDerived,omitempty"`
 }
 
 type Post struct {
@@ -134,6 +135,7 @@ type Post struct {
 	Reviewers       []ReviewRequest  `json:"reviewers,omitempty"`
 	Verified        bool             `json:"verified"`
 	Genesis         string           `json:"genesis,omitempty"`
+	DerivedFrom     []Attribution    `json:"derivedFrom,omitempty"`
 }
 
 type Story struct {
@@ -222,6 +224,8 @@ type persisted struct {
 	Events   []Activity     `json:"events"`
 	Remotes  []RemoteFollow `json:"remotes"`
 	Comments []PostComment  `json:"comments"`
+	Drafts   []Draft        `json:"drafts"`
+	Notices  []Notice       `json:"notices"`
 }
 
 type Store struct {
@@ -240,6 +244,8 @@ type Store struct {
 	events   []Activity
 	remotes  map[string][]string
 	comments []PostComment
+	drafts   map[string]*Draft
+	notices  []Notice
 }
 
 func NewStore(root string) (*Store, error) {
@@ -256,6 +262,7 @@ func NewStore(root string) (*Store, error) {
 		sessions: map[string]*Session{},
 		invites:  map[string]*Invite{},
 		remotes:  map[string][]string{},
+		drafts:   map[string]*Draft{},
 		settings: Settings{SignupMode: SignupInvite, MinPassword: 12},
 	}
 	_ = s.load()
@@ -317,6 +324,12 @@ func (s *Store) load() error {
 		s.remotes[r.Handle] = append(s.remotes[r.Handle], r.Topic)
 	}
 	s.comments = p.Comments
+	s.notices = p.Notices
+	s.drafts = map[string]*Draft{}
+	for i := range p.Drafts {
+		cp := p.Drafts[i]
+		s.drafts[cp.ID] = &cp
+	}
 	return nil
 }
 
@@ -343,6 +356,10 @@ func (s *Store) save() error {
 	p.Settings = s.settings
 	p.Events = s.events
 	p.Comments = s.comments
+	p.Notices = s.notices
+	for _, d := range s.drafts {
+		p.Drafts = append(p.Drafts, *d)
+	}
 	for handle, topics := range s.remotes {
 		for _, t := range topics {
 			p.Remotes = append(p.Remotes, RemoteFollow{Handle: handle, Topic: t})
@@ -1034,6 +1051,8 @@ func (s *Store) Fork(id string, user *User, intent, note string) (*Post, error) 
 		Topics:        append([]string{}, src.Topics...),
 	}
 	s.posts[nid] = p
+	s.attachDerived(p, src, "fork", user.Handle, src.HeadSHA)
+	s.notifyDerivedLocked(src, p, "fork", user.Handle, src.HeadSHA)
 	s.refreshPost(src)
 	s.recordLocked("fork", src.ID, src.HeadSHA, user.Handle)
 	s.recordLocked("fork", nid, sha, user.Handle)
@@ -1173,7 +1192,10 @@ func (s *Store) CherryPickFrom(targetID, sourceID, sha string, user *User) (*Pos
 	}
 	s.refreshPost(dst)
 	dst.UpdatedAt = time.Now().UTC()
+	s.attachDerived(dst, src, "cherry", user.Handle, sha)
+	s.notifyDerivedLocked(src, dst, "cherry", user.Handle, sha)
 	s.recordLocked("cherry", dst.ID, dst.HeadSHA, user.Handle)
+	s.recordLocked("cherry", src.ID, src.HeadSHA, user.Handle)
 	return dst, s.save()
 }
 

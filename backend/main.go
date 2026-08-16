@@ -108,6 +108,16 @@ func main() {
 
 	mux.HandleFunc("GET /api/users/{handle}", s.handleUser)
 	mux.HandleFunc("GET /api/story/preview", s.handleStoryPreview)
+	mux.HandleFunc("GET /api/posts/{id}/derived", s.handleDerived)
+	mux.HandleFunc("GET /api/inbox", s.handleInbox)
+	mux.HandleFunc("POST /api/inbox/read", s.handleInboxRead)
+	mux.HandleFunc("PUT /api/me/prefs", s.handlePrefs)
+	mux.HandleFunc("GET /api/drafts", s.handleListDrafts)
+	mux.HandleFunc("POST /api/drafts", s.handleCreateDraft)
+	mux.HandleFunc("GET /api/drafts/{id}", s.handleGetDraft)
+	mux.HandleFunc("PUT /api/drafts/{id}", s.handleUpdateDraft)
+	mux.HandleFunc("DELETE /api/drafts/{id}", s.handleDeleteDraft)
+	mux.HandleFunc("POST /api/drafts/{id}/commit", s.handleCommitDraft)
 
 	var handler http.Handler = withCORS(withLog(mux))
 	if static != "" {
