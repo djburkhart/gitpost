@@ -414,7 +414,7 @@ export class GitPostStore extends DurableObject<Env> {
         read INTEGER,
         created_at TEXT
       )`,
-      `CREATE TABLE IF NOT EXISTS watches (
+      `CREATE TABLE IF NOT EXISTS repo_watches (
         id TEXT PRIMARY KEY,
         handle TEXT NOT NULL,
         repo TEXT NOT NULL,
@@ -803,7 +803,7 @@ export class GitPostStore extends DurableObject<Env> {
   }
 
   private listWatches(handle: string) {
-    return this.sql<any>("SELECT * FROM watches WHERE handle = ?", handle).map((w) => ({
+    return this.sql<any>("SELECT * FROM repo_watches WHERE handle = ?", handle).map((w) => ({
       id: w.id, handle: w.handle, repo: w.repo, provider: w.provider, lastTag: w.last_tag, createdAt: w.created_at,
     }));
   }
@@ -817,17 +817,17 @@ export class GitPostStore extends DurableObject<Env> {
   private watchRepo(handle: string, raw: string) {
     const repo = this.parseRepo(raw);
     if (!repo) return null;
-    const existing = this.one<any>("SELECT * FROM watches WHERE handle = ? AND repo = ?", handle, repo);
+    const existing = this.one<any>("SELECT * FROM repo_watches WHERE handle = ? AND repo = ?", handle, repo);
     if (existing) return { id: existing.id, handle, repo, provider: "github", lastTag: existing.last_tag, createdAt: existing.created_at };
     const id = hex(4);
     const ts = new Date().toISOString();
-    this.sql("INSERT INTO watches (id, handle, repo, provider, last_tag, created_at) VALUES (?, ?, ?, 'github', '', ?)", id, handle, repo, ts);
+    this.sql("INSERT INTO repo_watches (id, handle, repo, provider, last_tag, created_at) VALUES (?, ?, ?, 'github', '', ?)", id, handle, repo, ts);
     return { id, handle, repo, provider: "github", lastTag: "", createdAt: ts };
   }
 
   private unwatchRepo(handle: string, raw: string) {
     const repo = this.parseRepo(raw) || raw;
-    this.sql("DELETE FROM watches WHERE handle = ? AND repo = ?", handle, repo);
+    this.sql("DELETE FROM repo_watches WHERE handle = ? AND repo = ?", handle, repo);
   }
 
   private hintsFor(handle: string) {
@@ -838,7 +838,7 @@ export class GitPostStore extends DurableObject<Env> {
   }
 
   private async refreshChangelog(handle: string) {
-    for (const w of this.sql<any>("SELECT * FROM watches WHERE handle = ?", handle)) {
+    for (const w of this.sql<any>("SELECT * FROM repo_watches WHERE handle = ?", handle)) {
       const [owner, repo] = String(w.repo).split("/");
       if (!owner || !repo) continue;
       try {
@@ -860,7 +860,7 @@ export class GitPostStore extends DurableObject<Env> {
             hex(6), handle, `${w.repo} ${latest.tag_name}`, new Date().toISOString(),
           );
         }
-        this.sql("UPDATE watches SET last_tag = ? WHERE id = ?", latest.tag_name, w.id);
+        this.sql("UPDATE repo_watches SET last_tag = ? WHERE id = ?", latest.tag_name, w.id);
       } catch { /* ignore */ }
     }
     return this.hintsFor(handle);
