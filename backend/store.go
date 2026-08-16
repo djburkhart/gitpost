@@ -421,7 +421,7 @@ func (s *Store) save() error {
 	}
 	for handle, topics := range s.remotes {
 		for _, t := range topics {
-			p.Remotes = append(p.Remotes, RemoteFollow{Handle: handle, Topic: t})
+			p.Remotes = append(p.Remotes, RemoteFollow{Handle: handle, Topic: t, CreatedAt: time.Now().UTC()})
 		}
 	}
 	b, err := json.MarshalIndent(p, "", "  ")

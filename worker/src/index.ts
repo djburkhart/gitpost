@@ -251,14 +251,8 @@ export class GitPostStore extends DurableObject<Env> {
     } catch {
       ver = null;
     }
-    if (!ver || ver.value !== SEED_VERSION) {
-      for (const t of ["stars", "watches", "branches", "commits", "prs", "posts", "sessions", "users", "invites", "audits", "settings", "meta"]) {
-        try {
-          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${t}`);
-        } catch {
-          /* */
-        }
-      }
+    if (!ver) {
+      /* first boot — CREATE IF NOT EXISTS below is enough */
     }
     const statements = [
       `CREATE TABLE IF NOT EXISTS users (
@@ -370,6 +364,12 @@ export class GitPostStore extends DurableObject<Env> {
         value TEXT
       )`,
       `CREATE TABLE IF NOT EXISTS remotes (
+        handle TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        created_at TEXT,
+        PRIMARY KEY (handle, topic)
+      )`,
+      `CREATE TABLE IF NOT EXISTS topic_remotes (
         handle TEXT NOT NULL,
         topic TEXT NOT NULL,
         created_at TEXT,
@@ -713,6 +713,65 @@ export class GitPostStore extends DurableObject<Env> {
     return this.sql<any>("SELECT id FROM notices WHERE handle = ? AND read = 0", handle).length;
   }
 
+  private remoteRows(handle: string): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const add = (rows: { topic?: string }[]) => {
+      for (const r of rows) {
+        const t = normalizeTopicName(r.topic || "");
+        if (!t || seen.has(t)) continue;
+        seen.add(t);
+        out.push(t);
+      }
+    };
+    try {
+      add(this.sql<{ topic: string }>("SELECT topic FROM topic_remotes WHERE handle = ? ORDER BY topic", handle));
+    } catch {
+      /* table missing */
+    }
+    try {
+      add(this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ? ORDER BY topic", handle));
+    } catch {
+      /* old remotes table may lack topic */
+    }
+    return out;
+  }
+
+  private followRemote(handle: string, raw: string): string[] {
+    const topic = normalizeTopicName(raw);
+    if (!topic) throw new Error("bad request");
+    const ts = new Date().toISOString();
+    try {
+      this.sql("INSERT OR IGNORE INTO topic_remotes (handle, topic, created_at) VALUES (?, ?, ?)", handle, topic, ts);
+    } catch {
+      this.sql(
+        "CREATE TABLE IF NOT EXISTS topic_remotes (handle TEXT NOT NULL, topic TEXT NOT NULL, created_at TEXT, PRIMARY KEY (handle, topic))",
+      );
+      this.sql("INSERT OR IGNORE INTO topic_remotes (handle, topic, created_at) VALUES (?, ?, ?)", handle, topic, ts);
+    }
+    try {
+      this.sql("INSERT OR IGNORE INTO remotes (handle, topic, created_at) VALUES (?, ?, ?)", handle, topic, ts);
+    } catch {
+      /* legacy remotes schema — topic_remotes is source of truth */
+    }
+    return this.remoteRows(handle);
+  }
+
+  private unfollowRemote(handle: string, raw: string): string[] {
+    const topic = normalizeTopicName(raw);
+    try {
+      this.sql("DELETE FROM topic_remotes WHERE handle = ? AND topic = ?", handle, topic);
+    } catch {
+      /* */
+    }
+    try {
+      this.sql("DELETE FROM remotes WHERE handle = ? AND topic = ?", handle, topic);
+    } catch {
+      /* */
+    }
+    return this.remoteRows(handle);
+  }
+
   private contribution(handle: string) {
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
@@ -774,7 +833,7 @@ export class GitPostStore extends DurableObject<Env> {
     for (const p of this.sql<any>("SELECT * FROM posts")) {
       const maintainers = parseTopics(p.maintainers_json);
       if (p.owner !== handle && !maintainers.includes(handle)) continue;
-      starsMaintained += this.sql<any>("SELECT user FROM stars WHERE post_id = ?", p.id).length;
+      starsMaintained += this.sql<any>("SELECT handle FROM stars WHERE post_id = ?", p.id).length;
       if (p.protected) qualityMain += 3;
       const commits = this.sql<any>("SELECT sha FROM commits WHERE post_id = ?", p.id).length;
       if (commits >= 3) qualityMain += 1;
@@ -1525,7 +1584,7 @@ export class GitPostStore extends DurableObject<Env> {
         const followed = url.searchParams.get("followed") === "1";
         let remotes: string[] = [];
         if (followed && viewer) {
-          remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
+          remotes = this.remoteRows(viewer.handle);
         }
         let posts = this.sql<any>("SELECT * FROM posts ORDER BY updated_at DESC");
         if (topic) {
@@ -1576,7 +1635,13 @@ export class GitPostStore extends DurableObject<Env> {
       }
       if (path === "/api/topics" && method === "GET") {
         const counts = new Map<string, number>();
-        for (const p of this.sql<any>("SELECT topics_json FROM posts")) {
+        let rows: any[] = [];
+        try {
+          rows = this.sql<any>("SELECT topics_json FROM posts");
+        } catch {
+          rows = [];
+        }
+        for (const p of rows) {
           for (const t of parseTopics(p.topics_json)) counts.set(t, (counts.get(t) || 0) + 1);
         }
         const topics = [...counts.entries()]
@@ -1586,24 +1651,21 @@ export class GitPostStore extends DurableObject<Env> {
       }
       if (path === "/api/remotes" && method === "GET") {
         if (!viewer) return err(401, "unauthorized");
-        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ? ORDER BY topic", viewer.handle).map((r) => r.topic);
-        return json({ remotes });
+        return json({ remotes: this.remoteRows(viewer.handle) });
       }
       if (path === "/api/remotes" && method === "POST") {
         if (!viewer) return err(401, "unauthorized");
         const inb = await req.json<any>();
-        const topic = normalizeTopicName(inb.topic || "");
-        if (!topic) return err(400, "bad request");
-        this.sql("INSERT OR IGNORE INTO remotes (handle, topic, created_at) VALUES (?, ?, ?)", viewer.handle, topic, new Date().toISOString());
-        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
-        return json({ remotes });
+        try {
+          return json({ remotes: this.followRemote(viewer.handle, inb.topic || inb.remote || inb.name || "") });
+        } catch {
+          return err(400, "bad request");
+        }
       }
       const unf = path.match(/^\/api\/remotes\/([^/]+)$/);
       if (unf && method === "DELETE") {
         if (!viewer) return err(401, "unauthorized");
-        this.sql("DELETE FROM remotes WHERE handle = ? AND topic = ?", viewer.handle, normalizeTopicName(decodeURIComponent(unf[1])));
-        const remotes = this.sql<{ topic: string }>("SELECT topic FROM remotes WHERE handle = ?", viewer.handle).map((r) => r.topic);
-        return json({ remotes });
+        return json({ remotes: this.unfollowRemote(viewer.handle, decodeURIComponent(unf[1])) });
       }
 
       if (path === "/api/posts" && method === "POST") {
@@ -2245,7 +2307,19 @@ export class GitPostStore extends DurableObject<Env> {
         }
         const pub: any = this.publicUser(u);
         if (!viewer || viewer.handle !== u.handle) delete pub.email;
-        return json({ user: pub, posts, graph: this.contribution(u.handle), score: this.score(u.handle), derived });
+        let graph = null;
+        let score = null;
+        try {
+          graph = this.contribution(u.handle);
+        } catch {
+          graph = null;
+        }
+        try {
+          score = this.score(u.handle);
+        } catch {
+          score = { score: 0, reviews: 0, mergesAccepted: 0, taken: 0, qualityMain: 0, starsMaintained: 0 };
+        }
+        return json({ user: pub, posts, graph, score, derived });
       }
 
       if (path.match(/^\/api\/posts\/[^/]+\/derived$/) && method === "GET") {
